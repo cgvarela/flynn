@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -404,12 +405,14 @@ func (c *Client) StreamJobEvents(appID string) (*JobEventStream, error) {
 // GetJobLog returns a ReadCloser stream of the job with id of jobID, running
 // under appID. If tail is true, new log lines are streamed after the buffered
 // log.
-func (c *Client) GetJobLog(appID, jobID string, tail bool) (io.ReadCloser, error) {
+func (c *Client) GetJobLog(appID, jobID string, tail bool, lines int) (io.ReadCloser, error) {
 	path := fmt.Sprintf("/apps/%s/jobs/%s/log", appID, jobID)
+	query := url.Values{}
 	if tail {
-		path += "?tail=true"
+		query.Add("tail", "true")
 	}
-	res, err := c.rawReq("GET", path, nil, nil, nil)
+	query.Add("lines", strconv.Itoa(lines))
+	res, err := c.rawReq("GET", path+"?"+query.Encode(), nil, nil, nil)
 	if err != nil {
 		return nil, err
 	}
