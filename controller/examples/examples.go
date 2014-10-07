@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,8 @@ import (
 
 	cc "github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/flynn/discoverd/client"
+	"github.com/flynn/flynn/pkg/resource"
 )
 
 type generator struct {
@@ -31,6 +34,11 @@ func main() {
 		log.Fatal(err)
 	}
 
+	err = discoverd.Connect(conf.controllerDomain + ":1111")
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	client, err = cc.NewClient("http://"+conf.controllerDomain, conf.controllerKey)
 	if err != nil {
 		log.Fatal(err)
@@ -43,7 +51,8 @@ func main() {
 		resourceIds: make(map[string]string),
 	}
 
-	go e.listenAndServe()
+	providerLog := log.New(os.Stdout, "provider: ", 1)
+	go e.listenAndServe(providerLog)
 
 	examples := []example{
 		{"key_create", e.createKey},
@@ -63,7 +72,6 @@ func main() {
 		{"provider_list", e.listProviders},
 		{"provider_resource_create", e.createProviderResource},
 		{"provider_resource_get", e.getProviderResource},
-		{"provider_resource_update", e.updateProviderResource},
 		{"provider_resource_list", e.listProviderResources},
 		{"app_delete", e.deleteApp},
 	}
@@ -104,10 +112,26 @@ func main() {
 	encoder.Encode(res)
 }
 
-func (e *generator) listenAndServe() {
+func (e *generator) listenAndServe(l *log.Logger) {
+	l.Println("listenAndServe...")
 	http.HandleFunc("/providers/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Printf("GET /providers\n")
-		w.WriteHeader(200)
+		l.Printf("%s %s\n", r.Method, r.URL)
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(r.Body)
+		body := buf.String()
+		l.Printf("\t%s\n", body)
+
+		resource := &resource.Resource{}
+		res, err := json.Marshal(resource)
+		if err != nil {
+			l.Println(err)
+			w.WriteHeader(500)
+			return
+		}
+		_, err = w.Write(res)
+		if err != nil {
+			l.Println(err)
+		}
 	})
 
 	http.ListenAndServe(":"+e.conf.ourPort, nil)
@@ -214,10 +238,14 @@ func (e *generator) listReleases() {
 func (e *generator) createProvider() {
 	t := time.Now().UnixNano()
 	provider := &ct.Provider{
-		Name: fmt.Sprintf("example provider %d", t),
-		URL:  fmt.Sprintf("discoverd+http://%s/providers/%d", net.JoinHostPort(e.conf.ourAddr, e.conf.ourPort), t),
+		Name: fmt.Sprintf("example-provider-%d", t),
+		URL:  fmt.Sprintf("discoverd+http://example-provider-%d/providers/%d", t, t),
 	}
 	err := e.client.CreateProvider(provider)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = discoverd.Register(provider.Name, net.JoinHostPort(e.conf.ourAddr, e.conf.ourPort))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -247,14 +275,6 @@ func (e *generator) getProviderResource() {
 	providerID := e.resourceIds["provider"]
 	resourceID := e.resourceIds["provider_resource"]
 	e.client.GetResource(providerID, resourceID)
-}
-
-func (e *generator) updateProviderResource() {
-	resource := &ct.Resource{
-		ID:         e.resourceIds["provider_resource"],
-		ProviderID: e.resourceIds["provider"],
-	}
-	e.client.PutResource(resource)
 }
 
 func (e *generator) listProviderResources() {
