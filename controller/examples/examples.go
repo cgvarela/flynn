@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -79,6 +80,11 @@ func main() {
 		{"formation_get", e.getFormation},
 		{"formation_list", e.listFormations},
 		{"formation_delete", e.deleteFormation},
+		{"job_run", e.runJob},
+		{"job_list", e.listJobs},
+		{"job_update", e.updateJob},
+		{"job_log", e.getJobLog},
+		{"job_delete", e.deleteJob},
 		{"provider_create", e.createProvider},
 		{"provider_get", e.getProvider},
 		{"provider_list", e.listProviders},
@@ -88,10 +94,6 @@ func main() {
 		{"app_delete", e.deleteApp},
 	}
 
-	// TODO: POST /apps/:app_id/jobs
-	// TODO: PUT /apps/:app_id/jobs/:job_id
-	// TODO: DELETE /apps/:app_id/jobs/:job_id
-	// TODO: GET /apps/:app_id/jobs
 	// TODO: GET /apps/:app_id/jobs/:job_id/log (event-stream)
 
 	res := make(map[string]string)
@@ -304,6 +306,45 @@ func (e *generator) listFormations() {
 
 func (e *generator) deleteFormation() {
 	e.client.DeleteFormation(e.resourceIds["app"], e.resourceIds["release"])
+}
+
+func (e *generator) runJob() {
+	new_job := &ct.NewJob{
+		ReleaseID: e.resourceIds["release"],
+		Env: map[string]string{
+			"BODY": "Hello!",
+		},
+		Cmd: []string{"echo", "$BODY"},
+	}
+	job, err := e.client.RunJobDetached(e.resourceIds["app"], new_job)
+	if err == nil {
+		e.resourceIds["job"] = job.ID
+	}
+}
+
+func (e *generator) listJobs() {
+	e.client.JobList(e.resourceIds["app"])
+}
+
+func (e *generator) updateJob() {
+	job := &ct.Job{
+		ID:        e.resourceIds["job"],
+		AppID:     e.resourceIds["app"],
+		ReleaseID: e.resourceIds["release"],
+		State:     "down",
+	}
+	e.client.PutJob(job)
+}
+
+func (e *generator) getJobLog() {
+	res, err := e.client.GetJobLog(e.resourceIds["app"], e.resourceIds["job"], false)
+	if err == nil {
+		io.Copy(ioutil.Discard, res)
+	}
+}
+
+func (e *generator) deleteJob() {
+	e.client.DeleteJob(e.resourceIds["app"], e.resourceIds["job"])
 }
 
 func (e *generator) createProvider() {
