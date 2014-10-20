@@ -164,7 +164,8 @@ func (e *generator) deleteKey() {
 }
 
 func (e *generator) createApp() {
-	app := &ct.App{Name: "my-app"}
+	t := time.Now().UnixNano()
+	app := &ct.App{Name: fmt.Sprintf("my-app-%d", t)}
 	err := e.client.CreateApp(app)
 	if err == nil {
 		e.resourceIds["app"] = app.ID
@@ -181,8 +182,7 @@ func (e *generator) listApps() {
 
 func (e *generator) updateApp() {
 	app := &ct.App{
-		ID:   e.resourceIds["app"],
-		Name: "my-app",
+		ID: e.resourceIds["app"],
 		Meta: map[string]string{
 			"bread": "with hemp",
 		},
