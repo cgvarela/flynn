@@ -267,9 +267,6 @@ func (d *DockerBackend) Attach(req *AttachRequest) error {
 			Stdout:       req.Stdout != nil,
 			Stderr:       req.Stderr != nil,
 		}
-		if req.Lines != 0 {
-			logOpts.Tail = strconv.Itoa(int(req.Lines))
-		}
 		if err := d.docker.Logs(logOpts); err != nil {
 			return err
 		}

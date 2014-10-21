@@ -13,7 +13,6 @@ type AttachRequest struct {
 	Stream bool
 	Height uint16
 	Width  uint16
-	Lines  int
 
 	Attached chan struct{}
 

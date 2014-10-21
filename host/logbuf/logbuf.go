@@ -1,10 +1,8 @@
 package logbuf
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path"
@@ -91,56 +89,15 @@ func (l *Log) Write(data Data) error {
 // Read old log lines from a logfile.
 func (l *Log) Read(lines int, follow bool, ch chan Data, done chan struct{}) error {
 	name := l.l.Filename // TODO: stitch older files together
-	fmt.Println("lines is", lines)
 
-	f, err := os.Open(name)
-	defer f.Close()
-	if err != nil {
-		return err
-	}
-
-	// seek to line if needed
 	var seek int64
-	if lines > 0 {
-		blockSize := 512
-		block := -1
-		size, err := f.Seek(0, os.SEEK_END)
+	if lines == 0 {
+		f, err := os.Open(name)
+		defer f.Close()
 		if err != nil {
 			return err
 		}
-		buf := make([]byte, blockSize)
-		count := 0
-		for {
-			step := int64(block * blockSize)
-			pos := size + step
-			if pos < 0 {
-				pos = 0
-			}
-
-			f.Seek(pos, os.SEEK_SET)
-			if _, err := f.Read(buf); err != nil {
-				return err
-			}
-			count += bytes.Count(buf, []byte("\n"))
-			if count >= lines+1 { // looking for the newline before our first line
-				diff := count - (lines + 1)
-				lastpos := 0
-				for diff >= 0 {
-					lastpos += bytes.Index(buf[lastpos:], []byte("\n")) + 1
-					diff--
-				}
-				seek = pos + int64(lastpos)
-				break
-			}
-			if pos == 0 { // less lines in entire file, return everything
-				seek = 0
-				break
-			}
-			block--
-		}
-	} else if lines == 0 {
-		seek, err = f.Seek(0, os.SEEK_END)
-		if err != nil {
+		if seek, err = f.Seek(0, os.SEEK_END); err != nil {
 			return err
 		}
 	} else if lines == -1 {
@@ -156,6 +113,9 @@ func (l *Log) Read(lines int, follow bool, ch chan Data, done chan struct{}) err
 			Whence: os.SEEK_SET,
 		},
 	})
+	if err != nil {
+		return err
+	}
 outer:
 	for {
 		select {

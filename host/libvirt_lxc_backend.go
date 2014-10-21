@@ -723,14 +723,15 @@ func (l *LibvirtLXCBackend) Attach(req *AttachRequest) (err error) {
 		req.Attached <- struct{}{}
 	}
 
+	lines := -1
 	if !req.Logs {
-		req.Lines = 0
+		lines = 0
 	}
 
 	log := l.openLog(req.Job.Job.ID)
 	ch := make(chan logbuf.Data)
 	done := make(chan struct{})
-	go log.Read(req.Lines, req.Stream, ch, done)
+	go log.Read(lines, req.Stream, ch, done)
 	defer close(done)
 
 	for data := range ch {

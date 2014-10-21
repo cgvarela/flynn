@@ -136,7 +136,6 @@ type AttachReq struct {
 	Flags  AttachFlag
 	Height uint16
 	Width  uint16
-	Lines  int
 }
 
 type AttachFlag uint8
