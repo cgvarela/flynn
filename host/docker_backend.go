@@ -204,7 +204,7 @@ func (d *DockerBackend) Attach(req *AttachRequest) error {
 		Container:    req.Job.ContainerID,
 		InputStream:  req.Stdin,
 		OutputStream: outW,
-		Logs:         false,
+		Logs:         req.Logs,
 		Stream:       req.Stream,
 		Success:      req.Attached,
 		Stdout:       req.Stdout != nil,
@@ -255,20 +255,6 @@ func (d *DockerBackend) Attach(req *AttachRequest) error {
 					}
 				}
 			}()
-		}
-	}
-
-	if req.Logs {
-		logOpts := docker.LogsOptions{
-			Container:    req.Job.ContainerID,
-			OutputStream: outW,
-			Follow:       false,
-			Timestamps:   false,
-			Stdout:       req.Stdout != nil,
-			Stderr:       req.Stderr != nil,
-		}
-		if err := d.docker.Logs(logOpts); err != nil {
-			return err
 		}
 	}
 

@@ -406,11 +406,10 @@ func (c *Client) StreamJobEvents(appID string) (*JobEventStream, error) {
 // log.
 func (c *Client) GetJobLog(appID, jobID string, tail bool) (io.ReadCloser, error) {
 	path := fmt.Sprintf("/apps/%s/jobs/%s/log", appID, jobID)
-	query := url.Values{}
 	if tail {
-		query.Add("tail", "true")
+		path += "?tail=true"
 	}
-	res, err := c.rawReq("GET", path+"?"+query.Encode(), nil, nil, nil)
+	res, err := c.rawReq("GET", path, nil, nil, nil)
 	if err != nil {
 		return nil, err
 	}

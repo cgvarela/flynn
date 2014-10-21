@@ -18,7 +18,6 @@ Stream log for a specific job.
 Options:
 	-s, --split-stderr  send stderr lines to stderr
 	-f, --follow        stream new lines after printing log buffer
-	-n <num>            limit log buffer to a certain number of lines
 `)
 }
 
