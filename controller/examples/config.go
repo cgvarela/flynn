@@ -14,24 +14,21 @@ type config struct {
 	ourPort          string
 }
 
-func loadConfigFromEnv() (c *config, err error) {
-	c = &config{}
+func loadConfigFromEnv() (*config, error) {
+	c := &config{}
 	c.controllerDomain = os.Getenv("CONTROLLER_DOMAIN")
 	if c.controllerDomain == "" {
-		err = fmt.Errorf("CONTROLLER_DOMAIN is required")
-		return nil, err
+		return nil, fmt.Errorf("CONTROLLER_DOMAIN is required")
 	}
 	c.controllerKey = os.Getenv("CONTROLLER_KEY")
 	if c.controllerKey == "" {
-		err = fmt.Errorf("CONTROLLER_KEY is required")
-		return nil, err
+		return nil, fmt.Errorf("CONTROLLER_KEY is required")
 	}
 	c.ourAddr = os.Getenv("ADDR")
 	if c.ourAddr == "" {
-		err = c.discoverAddr()
+		err := c.discoverAddr()
 		if err != nil {
-			err = fmt.Errorf("Discovery failed, ADDR is required")
-			return nil, err
+			return nil, fmt.Errorf("Discovery failed, ADDR is required")
 		}
 	}
 	port := os.Getenv("PORT")
