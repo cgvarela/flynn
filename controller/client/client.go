@@ -360,7 +360,7 @@ func (c *Client) GetFormation(appID, releaseID string) (*ct.Formation, error) {
 	return formation, c.get(fmt.Sprintf("/apps/%s/formations/%s", appID, releaseID), formation)
 }
 
-func (c *Client) ListFormations(appID string) ([]*ct.Formation, error) {
+func (c *Client) FormationList(appID string) ([]*ct.Formation, error) {
 	var formations []*ct.Formation
 	return formations, c.get(fmt.Sprintf("/apps/%s/formations", appID), &formations)
 }
