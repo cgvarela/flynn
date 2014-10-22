@@ -124,7 +124,7 @@ func main() {
 }
 
 func (e *generator) listenAndServe(l *log.Logger) {
-	l.Println("listenAndServe...")
+	l.Printf("Starting mock provider server on port %s\n", e.conf.ourPort)
 	http.HandleFunc("/providers/", func(w http.ResponseWriter, r *http.Request) {
 		l.Printf("%s %s\n", r.Method, r.URL)
 		buf := new(bytes.Buffer)
