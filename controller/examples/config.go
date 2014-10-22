@@ -66,16 +66,7 @@ func (c *config) discoverAddr() error {
 		}
 		for _, iAddr := range addrs {
 			iAddrParts := strings.Split(iAddr, ".")
-			if len(iAddrParts) != 4 {
-				continue
-			}
-			if cAddrParts[0] != iAddrParts[0] {
-				continue
-			}
-			if cAddrParts[1] != iAddrParts[1] {
-				continue
-			}
-			if cAddrParts[2] != iAddrParts[2] {
+			if len(iAddrParts) != 4 || cAddrParts[0] != iAddrParts[0] || cAddrParts[1] != iAddrParts[1] || cAddrParts[2] != iAddrParts[2] {
 				continue
 			}
 			ourAddr = iAddr
