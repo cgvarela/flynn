@@ -131,15 +131,11 @@ func (e *generator) listenAndServe(l *log.Logger) {
 		l.Printf("\t%s\n", body)
 
 		resource := &resource.Resource{}
-		res, err := json.Marshal(resource)
+		err := json.NewEncoder(w).Encode(resource)
 		if err != nil {
 			l.Println(err)
 			w.WriteHeader(500)
 			return
-		}
-		_, err = w.Write(res)
-		if err != nil {
-			l.Println(err)
 		}
 	})
 
