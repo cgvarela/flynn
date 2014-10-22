@@ -244,7 +244,7 @@ func (c *Client) CreateApp(app *ct.App) error {
 
 func (c *Client) UpdateApp(app *ct.App) error {
 	if app.ID == "" {
-		return errors.New("controller: midding id")
+		return errors.New("controller: missing id")
 	}
 	return c.post(fmt.Sprintf("/apps/%s", app.ID), app, app)
 }
