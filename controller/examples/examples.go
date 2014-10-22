@@ -301,7 +301,7 @@ func (e *generator) getFormation() {
 }
 
 func (e *generator) listFormations() {
-	e.client.ListFormations(e.resourceIds["app"])
+	e.client.FormationList(e.resourceIds["app"])
 }
 
 func (e *generator) deleteFormation() {
