@@ -104,23 +104,21 @@ func main() {
 
 	var out io.Writer
 	if len(os.Args) > 1 {
-		out, err = os.OpenFile(os.Args[1], os.O_CREATE|os.O_WRONLY, 0644)
+		out, err = os.Create(os.Args[1])
 		if err != nil {
 			log.Fatal(err)
 		}
 	} else {
 		out = os.Stdout
 	}
-	data, err := json.Marshal(res)
+	data, err := json.MarshalIndent(res, "", "\t")
 	if err != nil {
 		log.Fatal(err)
 	}
-	var formatted bytes.Buffer
-	err = json.Indent(&formatted, data, "", "\t")
+	_, err = out.Write(data)
 	if err != nil {
 		log.Fatal(err)
 	}
-	formatted.WriteTo(out)
 }
 
 func (e *generator) listenAndServe(l *log.Logger) {
