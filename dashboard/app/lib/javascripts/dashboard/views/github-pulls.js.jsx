@@ -1,17 +1,8 @@
-/** @jsx React.DOM */
-//= require ../stores/github-pulls
-//= require ../actions/github-pulls
-//= require ./github-pull
-//= require ScrollPagination
-
-(function () {
-
-"use strict";
-
-var GithubPullsStore = Dashboard.Stores.GithubPulls;
-var GithubPullsActions = Dashboard.Actions.GithubPulls;
-
-var ScrollPagination = window.ScrollPagination;
+import { assertEqual } from 'marbles/utils';
+import ScrollPagination from 'ScrollPagination';
+import GithubPullsStore from '../stores/github-pulls';
+import GithubPullsActions from '../actions/github-pulls';
+import GithubPull from './github-pull';
 
 function getPullsStoreId (props) {
 	return {
@@ -34,18 +25,17 @@ function getState (props) {
 	return state;
 }
 
-Dashboard.Views.GithubPulls = React.createClass({
+var GithubPulls = React.createClass({
 	displayName: "Views.GithubPulls",
 
 	render: function () {
-		var PullRequest = this.props.pullRequestComponent || Dashboard.Views.GithubPull;
+		var PullRequest = this.props.pullRequestComponent || GithubPull;
 		var pullRequestProps = this.props.pullRequestProps || {};
-		var handlePageEvent = this.__handlePageEvent;
 
 		return (
 			<section className="github-pulls">
 				<ScrollPagination
-					ref="scrollPagination"
+					manager={this.props.scrollPaginationManager}
 					hasPrevPage={this.state.pullsHasPrevPage}
 					hasNextPage={this.state.pullsHasNextPage}
 					unloadPage={GithubPullsActions.unloadPageId.bind(null, this.state.pullsStoreId)}
@@ -60,17 +50,17 @@ Dashboard.Views.GithubPulls = React.createClass({
 						return (
 							<ScrollPagination.Page
 								key={page.id}
+								manager={this.props.scrollPaginationManager}
 								id={page.id}
-								onPageEvent={handlePageEvent}
-								component={React.DOM.ul}>
+								component='ul'>
 
 								{page.pulls.map(function (pull) {
 									return (
 										<li key={pull.id}>
-											{PullRequest(Marbles.Utils.extend({
-												pull: pull,
-												pullStoreId: this.state.pullsStoreId
-											}, pullRequestProps))}
+											<PullRequest
+												pull={pull}
+												pullStoreId={this.state.pullsStoreId}
+												{...pullRequestProps} />
 										</li>
 									);
 								}, this)}
@@ -80,6 +70,12 @@ Dashboard.Views.GithubPulls = React.createClass({
 				</ScrollPagination>
 			</section>
 		);
+	},
+
+	getDefaultProps: function () {
+		return {
+			scrollPaginationManager: new ScrollPagination.Manager()
+		};
 	},
 
 	getInitialState: function () {
@@ -93,7 +89,7 @@ Dashboard.Views.GithubPulls = React.createClass({
 	componentWillReceiveProps: function (props) {
 		var oldPullsStoreId = this.state.pullsStoreId;
 		var newPullsStoreId = getPullsStoreId(props);
-		if ( !Marbles.Utils.assertEqual(oldPullsStoreId, newPullsStoreId) ) {
+		if ( !assertEqual(oldPullsStoreId, newPullsStoreId) ) {
 			GithubPullsStore.removeChangeListener(oldPullsStoreId, this.__handleStoreChange);
 			GithubPullsStore.addChangeListener(newPullsStoreId, this.__handleStoreChange);
 			this.__handleStoreChange(props);
@@ -106,11 +102,7 @@ Dashboard.Views.GithubPulls = React.createClass({
 
 	__handleStoreChange: function (props) {
 		this.setState(getState(props || this.props));
-	},
-
-	__handlePageEvent: function (pageId, event) {
-		this.refs.scrollPagination.handlePageEvent(pageId, event);
 	}
 });
 
-})();
+export default GithubPulls;

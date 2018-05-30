@@ -1,11 +1,9 @@
-//= require ../store
-//= require ../dispatcher
+import State from 'marbles/state';
+import Store from '../store';
+import Config from '../config';
+import Dispatcher from '../dispatcher';
 
-(function () {
-
-"use strict";
-
-var Apps = Dashboard.Stores.Apps = Dashboard.Store.createClass({
+var Apps = Store.createClass({
 	displayName: "Stores.Apps",
 
 	getState: function () {
@@ -20,34 +18,51 @@ var Apps = Dashboard.Stores.Apps = Dashboard.Store.createClass({
 
 	getInitialState: function () {
 		return {
-			apps: [],
+			fetched: false,
+			apps: []
 		};
 	},
 
 	handleEvent: function (event) {
 		switch (event.name) {
-			case "APP:CREATED":
-				this.__handleAppCreated(event.app);
+		case 'APP':
+			this.__addOrReplaceApp(event.data);
 			break;
 
-			case "APP:DELETED":
-				this.__handleAppDeleted(event.appId);
+		case 'APP_DELETED':
+			this.__handleAppDeleted(event.app);
 			break;
 		}
 	},
 
 	__fetchApps: function () {
-		return Dashboard.client.getApps().then(function (args) {
+		return this.__getClient().getApps().then(function (args) {
 			var res = args[0];
 			this.setState({
-				apps: res.map(function (app) {
-					if (app.name === "controller") {
-						app.protected = true; // bug
-					}
-					return app;
-				}),
+				fetched: true,
+				apps: res
 			});
 		}.bind(this));
+	},
+
+	__addOrReplaceApp: function (app) {
+		var apps = [];
+		var appFound = false;
+		this.state.apps.forEach(function (a) {
+			if (a.id === app.id) {
+				appFound = true;
+				apps.push(app);
+			} else {
+				apps.push(a);
+			}
+		});
+		if ( !appFound ) {
+			this.__handleAppCreated(app);
+		} else {
+			this.setState({
+				apps: apps
+			});
+		}
 	},
 
 	__handleAppCreated: function (app) {
@@ -64,10 +79,14 @@ var Apps = Dashboard.Stores.Apps = Dashboard.Store.createClass({
 		this.setState({
 			apps: apps
 		});
+	},
+
+	__getClient: function () {
+		return Config.client;
 	}
 
-}, Marbles.State);
+}, State);
 
-Apps.registerWithDispatcher(Dashboard.Dispatcher);
+Apps.registerWithDispatcher(Dispatcher);
 
-})();
+export default Apps;

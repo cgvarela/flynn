@@ -3,33 +3,18 @@ package main
 import (
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"strconv"
 	"sync"
+	"time"
 
-	"github.com/flynn/flynn/discoverd/client"
+	"github.com/flynn/flynn/discoverd/cache"
+	"github.com/flynn/flynn/pkg/connutil"
+	"github.com/flynn/flynn/router/proxy"
 	"github.com/flynn/flynn/router/types"
+	"golang.org/x/net/context"
 )
-
-func NewTCPListener(ip string, startPort, endPort int, ds DataStore, dc DiscoverdClient) *TCPListener {
-	l := &TCPListener{
-		IP:        ip,
-		ds:        ds,
-		wm:        NewWatchManager(),
-		discoverd: dc,
-		services:  make(map[string]*tcpService),
-		routes:    make(map[string]*tcpRoute),
-		ports:     make(map[int]*tcpRoute),
-		listeners: make(map[int]net.Listener),
-		startPort: startPort,
-		endPort:   endPort,
-	}
-	l.Watcher = l.wm
-	l.DataStoreReader = l.ds
-	return l
-}
 
 type TCPListener struct {
 	Watcher
@@ -40,13 +25,15 @@ type TCPListener struct {
 	discoverd DiscoverdClient
 	ds        DataStore
 	wm        *WatchManager
+	stopSync  func()
 
-	startPort int
-	endPort   int
-	listeners map[int]net.Listener
+	startPort     int
+	endPort       int
+	reservedPorts []int
+	listeners     map[int]net.Listener
 
 	mtx      sync.RWMutex
-	services map[string]*tcpService
+	services map[string]*service
 	routes   map[string]*tcpRoute
 	ports    map[int]*tcpRoute
 	closed   bool
@@ -59,14 +46,18 @@ func (l *TCPListener) AddRoute(route *router.Route) error {
 	if l.closed {
 		return ErrClosed
 	}
+	for _, port := range l.reservedPorts {
+		if r.Port == port {
+			return ErrReserved
+		}
+	}
 	if r.Port == 0 {
 		return l.addWithAllocatedPort(route)
 	}
-	route.ID = md5sum(strconv.Itoa(r.Port))
 	return l.ds.Add(route)
 }
 
-func (l *TCPListener) SetRoute(route *router.Route) error {
+func (l *TCPListener) UpdateRoute(route *router.Route) error {
 	r := route.TCPRoute()
 	l.mtx.RLock()
 	defer l.mtx.RUnlock()
@@ -76,8 +67,7 @@ func (l *TCPListener) SetRoute(route *router.Route) error {
 	if r.Port == 0 {
 		return errors.New("router: a port number needs to be specified")
 	}
-	route.ID = md5sum(strconv.Itoa(r.Port))
-	return l.ds.Set(route)
+	return l.ds.Update(route)
 }
 
 var ErrNoPorts = errors.New("router: no ports available")
@@ -87,7 +77,6 @@ func (l *TCPListener) addWithAllocatedPort(route *router.Route) error {
 	l.mtx.RLock()
 	defer l.mtx.RUnlock()
 	for r.Port = range l.listeners {
-		r.Route.ID = md5sum(strconv.Itoa(r.Port))
 		tempRoute := r.ToRoute()
 		if err := l.ds.Add(tempRoute); err == nil {
 			*route = *tempRoute
@@ -107,27 +96,94 @@ func (l *TCPListener) RemoveRoute(id string) error {
 }
 
 func (l *TCPListener) Start() error {
-	started := make(chan error)
+	ctx := context.Background() // TODO(benburkert): make this an argument
+	ctx, l.stopSync = context.WithCancel(ctx)
+
+	if l.Watcher != nil {
+		return errors.New("router: tcp listener already started")
+	}
+	if l.wm == nil {
+		l.wm = NewWatchManager()
+	}
+	l.Watcher = l.wm
+
+	if l.ds == nil {
+		return errors.New("router: tcp listener missing data store")
+	}
+	l.DataStoreReader = l.ds
+
+	l.services = make(map[string]*service)
+	l.routes = make(map[string]*tcpRoute)
+	l.ports = make(map[int]*tcpRoute)
+	l.listeners = make(map[int]net.Listener)
 
 	if l.startPort != 0 && l.endPort != 0 {
 		for i := l.startPort; i <= l.endPort; i++ {
-			listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", l.IP, i))
+			addr := fmt.Sprintf("%s:%d", l.IP, i)
+			listener, err := listenFunc("tcp4", addr)
 			if err != nil {
 				l.Close()
-				return err
+				return listenErr{addr, err}
 			}
 			l.listeners[i] = listener
 		}
 	}
 
-	go l.ds.Sync(&tcpSyncHandler{l: l}, started)
-	return <-started
+	// TODO(benburkert): the sync API cannot handle routes deleted while the
+	// listen/notify connection is disconnected
+	if err := l.startSync(ctx); err != nil {
+		l.Close()
+		return err
+	}
+
+	return nil
+}
+
+func (l *TCPListener) startSync(ctx context.Context) error {
+	errc := make(chan error)
+	startc := l.doSync(ctx, errc)
+
+	select {
+	case err := <-errc:
+		return err
+	case <-startc:
+		go l.runSync(ctx, errc)
+		return nil
+	}
+}
+
+func (l *TCPListener) runSync(ctx context.Context, errc chan error) {
+	err := <-errc
+
+	for {
+		if err == nil {
+			return
+		}
+		log.Printf("router: tcp sync error: %s", err)
+
+		time.Sleep(2 * time.Second)
+
+		l.doSync(ctx, errc)
+
+		err = <-errc
+	}
+}
+
+func (l *TCPListener) doSync(ctx context.Context, errc chan<- error) <-chan struct{} {
+	startc := make(chan struct{})
+
+	go func() { errc <- l.ds.Sync(ctx, &tcpSyncHandler{l: l}, startc) }()
+
+	return startc
 }
 
 func (l *TCPListener) Close() error {
 	l.mtx.Lock()
 	defer l.mtx.Unlock()
-	l.ds.StopSync()
+	if l.closed {
+		return nil
+	}
+	l.stopSync()
 	for _, s := range l.routes {
 		s.Close()
 	}
@@ -140,6 +196,16 @@ func (l *TCPListener) Close() error {
 
 type tcpSyncHandler struct {
 	l *TCPListener
+}
+
+func (h *tcpSyncHandler) Current() map[string]struct{} {
+	h.l.mtx.RLock()
+	defer h.l.mtx.RUnlock()
+	ids := make(map[string]struct{}, len(h.l.routes))
+	for id := range h.l.routes {
+		ids[id] = struct{}{}
+	}
+	return ids
 }
 
 func (h *tcpSyncHandler) Set(data *router.Route) error {
@@ -160,22 +226,28 @@ func (h *tcpSyncHandler) Set(data *router.Route) error {
 	if service != nil && service.name != r.Service {
 		service.refs--
 		if service.refs <= 0 {
-			service.ss.Close()
+			service.Close()
 			delete(h.l.services, service.name)
 		}
 		service = nil
 	}
 	if service == nil {
-		ss, err := h.l.discoverd.NewServiceSet(r.Service)
+		sc, err := cache.New(h.l.discoverd.Service(r.Service))
 		if err != nil {
 			return err
 		}
-		service = &tcpService{
-			name: r.Service,
-			ss:   ss,
-		}
+
+		service = newService(r.Service, sc, h.l.wm, r.DrainBackends)
 		h.l.services[r.Service] = service
 	}
+	r.service = service
+	var bf proxy.BackendListFunc
+	if r.Leader {
+		bf = backendFunc(r.Service, service.sc.Leader)
+	} else {
+		bf = backendFunc(r.Service, service.sc.Instances)
+	}
+	r.rp = proxy.NewReverseProxy(bf, nil, false, service, logger)
 	if listener, ok := h.l.listeners[r.Port]; ok {
 		r.l = listener
 		delete(h.l.listeners, r.Port)
@@ -189,13 +261,10 @@ func (h *tcpSyncHandler) Set(data *router.Route) error {
 		return err
 	}
 	service.refs++
-	r.mtx.Lock()
-	r.service = service
-	r.mtx.Unlock()
 	h.l.routes[data.ID] = r
 	h.l.ports[r.Port] = r
 
-	go h.l.wm.Send(&router.Event{Event: "set", ID: data.ID})
+	go h.l.wm.Send(&router.Event{Event: router.EventTypeRouteSet, ID: data.ID, Route: r.ToRoute()})
 	return nil
 }
 
@@ -213,13 +282,13 @@ func (h *tcpSyncHandler) Remove(id string) error {
 
 	r.service.refs--
 	if r.service.refs <= 0 {
-		r.service.ss.Close()
+		r.service.sc.Close()
 		delete(h.l.services, r.service.name)
 	}
 
 	delete(h.l.routes, id)
 	delete(h.l.ports, r.Port)
-	go h.l.wm.Send(&router.Event{Event: "remove", ID: id})
+	go h.l.wm.Send(&router.Event{Event: router.EventTypeRouteRemove, ID: id, Route: r.ToRoute()})
 	return nil
 }
 
@@ -228,15 +297,18 @@ type tcpRoute struct {
 	*router.TCPRoute
 	l       net.Listener
 	addr    string
-	service *tcpService
-	mtx     sync.RWMutex
+	service *service
+	rp      *proxy.ReverseProxy
 }
 
 func (r *tcpRoute) Serve(started chan<- error) {
 	var err error
 	// TODO: close the listener while there are no backends available
 	if r.l == nil {
-		r.l, err = net.Listen("tcp", r.addr)
+		r.l, err = listenFunc("tcp4", r.addr)
+	}
+	if err != nil {
+		err = listenErr{r.addr, err}
 	}
 	started <- err
 	if err != nil {
@@ -247,9 +319,7 @@ func (r *tcpRoute) Serve(started chan<- error) {
 		if err != nil {
 			break
 		}
-		r.mtx.RLock()
-		go r.service.handle(conn)
-		r.mtx.RUnlock()
+		go r.ServeConn(conn)
 	}
 }
 
@@ -271,51 +341,6 @@ func (r *tcpRoute) Close() {
 	r.l.Close()
 }
 
-type tcpService struct {
-	name string
-	ss   discoverd.ServiceSet
-	refs int
-}
-
-func (s *tcpService) getBackend() (conn net.Conn) {
-	var err error
-	for _, addr := range shuffle(s.ss.Addrs()) {
-		// TODO: set deadlines
-		conn, err = net.Dial("tcp", addr)
-		if err != nil {
-			log.Println("Error connecting to TCP backend:", err)
-			// TODO: limit number of backends tried
-			// TODO: temporarily quarantine failing backends
-			continue
-		}
-		return
-	}
-	if err == nil {
-		log.Println("No TCP backends found")
-	} else {
-		log.Println("Unable to find live backend, last error:", err)
-	}
-	return
-}
-
-func (s *tcpService) handle(conn net.Conn) {
-	defer conn.Close()
-	backend := s.getBackend()
-	if backend == nil {
-		return
-	}
-	defer backend.Close()
-
-	// TODO: PROXY protocol
-
-	done := make(chan struct{})
-	go func() {
-		io.Copy(backend, conn)
-		backend.(*net.TCPConn).CloseWrite()
-		close(done)
-	}()
-	io.Copy(conn, backend)
-	conn.(*net.TCPConn).CloseWrite()
-	<-done
-	return
+func (r *tcpRoute) ServeConn(conn net.Conn) {
+	r.rp.ServeConn(context.Background(), connutil.CloseNotifyConn(conn))
 }

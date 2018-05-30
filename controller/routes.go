@@ -1,62 +1,90 @@
 package main
 
 import (
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/go-martini/martini"
-	ct "github.com/flynn/flynn/controller/types"
+	"net/http"
+
+	"github.com/flynn/flynn/controller/schema"
+	"github.com/flynn/flynn/pkg/httphelper"
+	"github.com/flynn/flynn/pkg/postgres"
 	routerc "github.com/flynn/flynn/router/client"
 	"github.com/flynn/flynn/router/types"
+	"golang.org/x/net/context"
 )
 
-func createRoute(app *ct.App, router routerc.Client, route router.Route, r ResponseHelper) {
-	route.ParentRef = routeParentRef(app)
-	if err := router.CreateRoute(&route); err != nil {
-		r.Error(err)
+func createRoute(db *postgres.DB, rc routerc.Client, appID string, route *router.Route) error {
+	route.ParentRef = routeParentRef(appID)
+	if err := schema.Validate(route); err != nil {
+		return err
+	}
+	return rc.CreateRoute(route)
+}
+
+func (c *controllerAPI) CreateRoute(ctx context.Context, w http.ResponseWriter, req *http.Request) {
+	var route router.Route
+	if err := httphelper.DecodeJSON(req, &route); err != nil {
+		respondWithError(w, err)
 		return
 	}
-	r.JSON(200, &route)
-}
 
-func routeID(params martini.Params) string {
-	return params["routes_type"] + "/" + params["routes_id"]
-}
-
-func routeParentRef(app *ct.App) string {
-	return "controller/apps/" + app.ID
-}
-
-func getRouteMiddleware(app *ct.App, c martini.Context, params martini.Params, router routerc.Client, r ResponseHelper) {
-	route, err := router.GetRoute(routeID(params))
-	if err == routerc.ErrNotFound || err == nil && route.ParentRef != routeParentRef(app) {
-		err = ErrNotFound
+	if err := createRoute(c.appRepo.db, c.routerc, c.getApp(ctx).ID, &route); err != nil {
+		respondWithError(w, err)
+		return
 	}
+
+	httphelper.JSON(w, 200, &route)
+}
+
+func (c *controllerAPI) GetRoute(ctx context.Context, w http.ResponseWriter, req *http.Request) {
+	route, err := c.getRoute(ctx)
 	if err != nil {
-		r.Error(err)
+		respondWithError(w, err)
 		return
 	}
-	c.Map(route)
+
+	httphelper.JSON(w, 200, route)
 }
 
-func getRoute(route *router.Route, r ResponseHelper) {
-	r.JSON(200, route)
-}
-
-func getRouteList(app *ct.App, router routerc.Client, r ResponseHelper) {
-	routes, err := router.ListRoutes(routeParentRef(app))
+func (c *controllerAPI) GetRouteList(ctx context.Context, w http.ResponseWriter, req *http.Request) {
+	routes, err := c.routerc.ListRoutes(routeParentRef(c.getApp(ctx).ID))
 	if err != nil {
-		r.Error(err)
+		respondWithError(w, err)
 		return
 	}
-	r.JSON(200, routes)
+	httphelper.JSON(w, 200, routes)
 }
 
-func deleteRoute(route *router.Route, router routerc.Client, r ResponseHelper) {
-	err := router.DeleteRoute(route.ID)
+func (c *controllerAPI) UpdateRoute(ctx context.Context, w http.ResponseWriter, req *http.Request) {
+	var route *router.Route
+	if err := httphelper.DecodeJSON(req, &route); err != nil {
+		respondWithError(w, err)
+		return
+	}
+
+	err := c.routerc.UpdateRoute(route)
 	if err == routerc.ErrNotFound {
 		err = ErrNotFound
 	}
 	if err != nil {
-		r.Error(err)
+		respondWithError(w, err)
 		return
 	}
-	r.WriteHeader(200)
+	httphelper.JSON(w, 200, route)
+}
+
+func (c *controllerAPI) DeleteRoute(ctx context.Context, w http.ResponseWriter, req *http.Request) {
+	route, err := c.getRoute(ctx)
+	if err != nil {
+		respondWithError(w, err)
+		return
+	}
+
+	err = c.routerc.DeleteRoute(route.Type, route.ID)
+	if err == routerc.ErrNotFound {
+		err = ErrNotFound
+	}
+	if err != nil {
+		respondWithError(w, err)
+		return
+	}
+	w.WriteHeader(200)
 }

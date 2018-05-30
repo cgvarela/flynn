@@ -1,238 +1,243 @@
 package main
 
 import (
-	"bytes"
-	"encoding/base64"
-	"encoding/json"
-	"fmt"
 	"io"
-	"io/ioutil"
-	"net/http"
-	"strings"
 
-	. "github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/check.v1"
 	tu "github.com/flynn/flynn/controller/testutils"
 	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/controller/utils"
-	"github.com/flynn/flynn/host/types"
+	host "github.com/flynn/flynn/host/types"
 	"github.com/flynn/flynn/pkg/cluster"
 	"github.com/flynn/flynn/pkg/random"
+	. "github.com/flynn/go-check"
 )
 
 func (s *S) createTestJob(c *C, in *ct.Job) *ct.Job {
-	out := &ct.Job{}
-	res, err := s.Put("/apps/"+in.AppID+"/jobs/"+in.ID, in, out)
-	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
-	return out
+	c.Assert(s.c.PutJob(in), IsNil)
+	return in
 }
 
 func (s *S) TestJobList(c *C) {
 	app := s.createTestApp(c, &ct.App{Name: "job-list"})
-	release := s.createTestRelease(c, &ct.Release{})
+	release := s.createTestRelease(c, app.ID, &ct.Release{})
 	s.createTestFormation(c, &ct.Formation{ReleaseID: release.ID, AppID: app.ID})
-	s.createTestJob(c, &ct.Job{ID: "host0-job0", AppID: app.ID, ReleaseID: release.ID, Type: "web", State: "starting"})
+	id := random.UUID()
+	s.createTestJob(c, &ct.Job{UUID: id, AppID: app.ID, ReleaseID: release.ID, Type: "web", State: ct.JobStateStarting, Meta: map[string]string{"some": "info"}})
 
-	var list []ct.Job
-	res, err := s.Get("/apps/"+app.ID+"/jobs", &list)
+	list, err := s.c.JobList(app.ID)
 	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
 	c.Assert(len(list), Equals, 1)
 	job := list[0]
-	c.Assert(job.ID, Equals, "host0-job0")
+	c.Assert(job.UUID, Equals, id)
 	c.Assert(job.AppID, Equals, app.ID)
 	c.Assert(job.ReleaseID, Equals, release.ID)
+	c.Assert(job.Meta, DeepEquals, map[string]string{"some": "info"})
 }
 
-func newFakeLog(r io.Reader) *fakeLog {
-	return &fakeLog{r}
+func (s *S) TestJobListActive(c *C) {
+	app := s.createTestApp(c, &ct.App{Name: "job-list-active"})
+	release := s.createTestRelease(c, app.ID, &ct.Release{})
+
+	// mark all existing jobs as down
+	c.Assert(s.hc.db.Exec("UPDATE job_cache SET state = 'down'"), IsNil)
+
+	createJob := func(state ct.JobState) *ct.Job {
+		return s.createTestJob(c, &ct.Job{
+			UUID:      random.UUID(),
+			AppID:     app.ID,
+			ReleaseID: release.ID,
+			Type:      "web",
+			State:     state,
+			Meta:      map[string]string{"some": "info"},
+		})
+	}
+
+	jobs := []*ct.Job{
+		createJob(ct.JobStatePending),
+		createJob(ct.JobStateStarting),
+		createJob(ct.JobStateUp),
+		createJob(ct.JobStateStopping),
+		createJob(ct.JobStateDown),
+		createJob(ct.JobStatePending),
+		createJob(ct.JobStateStarting),
+		createJob(ct.JobStateUp),
+	}
+
+	list, err := s.c.JobListActive()
+	c.Assert(err, IsNil)
+	c.Assert(list, HasLen, 7)
+
+	// check that we only get jobs with a pending, starting, up or stopping
+	// state, most recently updated first
+	expected := []*ct.Job{jobs[7], jobs[6], jobs[5], jobs[3], jobs[2], jobs[1], jobs[0]}
+	for i, job := range expected {
+		actual := list[i]
+		c.Assert(actual.UUID, Equals, job.UUID)
+		c.Assert(actual.State, Equals, job.State)
+	}
 }
 
-type fakeLog struct {
-	io.Reader
+func (s *S) TestJobGet(c *C) {
+	app := s.createTestApp(c, &ct.App{Name: "job-get"})
+	release := s.createTestRelease(c, app.ID, &ct.Release{})
+	s.createTestFormation(c, &ct.Formation{ReleaseID: release.ID, AppID: app.ID})
+	uuid := random.UUID()
+	hostID := "host0"
+	jobID := cluster.GenerateJobID(hostID, uuid)
+	s.createTestJob(c, &ct.Job{
+		ID:        jobID,
+		UUID:      uuid,
+		HostID:    hostID,
+		AppID:     app.ID,
+		ReleaseID: release.ID,
+		Type:      "web",
+		State:     ct.JobStateStarting,
+		Meta:      map[string]string{"some": "info"},
+	})
+
+	// test getting the job with both the job ID and the UUID
+	for _, id := range []string{jobID, uuid} {
+		job, err := s.c.GetJob(app.ID, id)
+		c.Assert(err, IsNil)
+		c.Assert(job.ID, Equals, jobID)
+		c.Assert(job.UUID, Equals, uuid)
+		c.Assert(job.HostID, Equals, hostID)
+		c.Assert(job.AppID, Equals, app.ID)
+		c.Assert(job.ReleaseID, Equals, release.ID)
+		c.Assert(job.Meta, DeepEquals, map[string]string{"some": "info"})
+	}
 }
 
-func (l *fakeLog) Close() error { return nil }
-func (l *fakeLog) Write([]byte) (int, error) {
-	return 0, io.ErrUnexpectedEOF
+func (s *S) TestJobStateChanges(c *C) {
+	app := s.createTestApp(c, &ct.App{Name: "job-state-changes"})
+	release := s.createTestRelease(c, app.ID, &ct.Release{})
+	s.createTestFormation(c, &ct.Formation{ReleaseID: release.ID, AppID: app.ID})
+
+	// add a new pending job
+	uuid := random.UUID()
+	job := &ct.Job{
+		ID:        cluster.GenerateJobID("host0", uuid),
+		UUID:      uuid,
+		AppID:     app.ID,
+		ReleaseID: release.ID,
+		Type:      "web",
+		State:     ct.JobStatePending,
+	}
+	c.Assert(s.c.PutJob(job), IsNil)
+	gotJob, err := s.c.GetJob(app.ID, job.ID)
+	c.Assert(err, IsNil)
+	c.Assert(gotJob.State, Equals, ct.JobStatePending)
+
+	// update the state to starting
+	job.State = ct.JobStateStarting
+	c.Assert(s.c.PutJob(job), IsNil)
+	gotJob, err = s.c.GetJob(app.ID, job.ID)
+	c.Assert(err, IsNil)
+	c.Assert(gotJob.State, Equals, ct.JobStateStarting)
+
+	// update the state to up
+	job.State = ct.JobStateUp
+	c.Assert(s.c.PutJob(job), IsNil)
+	gotJob, err = s.c.GetJob(app.ID, job.ID)
+	c.Assert(err, IsNil)
+	c.Assert(gotJob.State, Equals, ct.JobStateUp)
+
+	// delete the app and check we can still mark the job as down
+	c.Assert(s.hc.db.Exec("app_delete", app.ID), IsNil)
+	job.State = ct.JobStateDown
+	c.Assert(s.c.PutJob(job), IsNil)
+	gotJob, err = s.c.GetJob(app.ID, job.ID)
+	c.Assert(err, IsNil)
+	c.Assert(gotJob.State, Equals, ct.JobStateDown)
+}
+
+func fakeHostID() string {
+	return random.Hex(16)
 }
 
 func (s *S) TestKillJob(c *C) {
 	app := s.createTestApp(c, &ct.App{Name: "killjob"})
-	hostID, jobID := random.UUID(), random.UUID()
-	hc := tu.NewFakeHostClient(hostID)
-	s.cc.SetHostClient(hostID, hc)
-
-	res, err := s.Delete("/apps/" + app.ID + "/jobs/" + hostID + "-" + jobID)
-	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
-	c.Assert(hc.IsStopped(jobID), Equals, true)
-}
-
-func (s *S) createLogTestApp(c *C, name string, stream io.Reader) (*ct.App, string, string) {
-	app := s.createTestApp(c, &ct.App{Name: name})
-	hostID, jobID := random.UUID(), random.UUID()
-	hc := tu.NewFakeHostClient(hostID)
-	hc.SetAttach(jobID, cluster.NewAttachClient(newFakeLog(stream)))
-	s.cc.SetHostClient(hostID, hc)
-	return app, hostID, jobID
-}
-
-func (s *S) TestJobLog(c *C) {
-	app, hostID, jobID := s.createLogTestApp(c, "joblog", strings.NewReader("foo"))
-
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s/apps/%s/jobs/%s-%s/log", s.srv.URL, app.ID, hostID, jobID), nil)
-	c.Assert(err, IsNil)
-	req.SetBasicAuth("", authKey)
-	res, err := http.DefaultClient.Do(req)
-	c.Assert(err, IsNil)
-	var buf bytes.Buffer
-	_, err = buf.ReadFrom(res.Body)
-	res.Body.Close()
-	c.Assert(err, IsNil)
-
-	c.Assert(buf.String(), Equals, "foo")
-}
-
-func (s *S) TestJobLogWait(c *C) {
-	app := s.createTestApp(c, &ct.App{Name: "joblog-wait"})
-	hostID, jobID := random.UUID(), random.UUID()
-	hc := tu.NewFakeHostClient(hostID)
-	hc.SetAttachFunc(jobID, func(req *host.AttachReq, wait bool) (cluster.AttachClient, error) {
-		if !wait {
-			return nil, cluster.ErrWouldWait
-		}
-		return cluster.NewAttachClient(newFakeLog(strings.NewReader("foo"))), nil
+	release := s.createTestRelease(c, app.ID, &ct.Release{})
+	hostID := fakeHostID()
+	uuid := random.UUID()
+	jobID := cluster.GenerateJobID(hostID, uuid)
+	s.createTestJob(c, &ct.Job{
+		ID:        jobID,
+		UUID:      uuid,
+		HostID:    hostID,
+		AppID:     app.ID,
+		ReleaseID: release.ID,
+		Type:      "web",
+		State:     ct.JobStateStarting,
+		Meta:      map[string]string{"some": "info"},
 	})
-	s.cc.SetHostClient(hostID, hc)
+	hc := tu.NewFakeHostClient(hostID, false)
+	hc.AddJob(&host.Job{ID: jobID})
+	s.cc.AddHost(hc)
 
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s/apps/%s/jobs/%s-%s/log", s.srv.URL, app.ID, hostID, jobID), nil)
+	err := s.c.DeleteJob(app.ID, jobID)
 	c.Assert(err, IsNil)
-	req.SetBasicAuth("", authKey)
-	res, err := http.DefaultClient.Do(req)
-	c.Assert(err, IsNil)
-	res.Body.Close()
-	c.Assert(res.StatusCode, Equals, 404)
-
-	req, err = http.NewRequest("GET", fmt.Sprintf("%s/apps/%s/jobs/%s-%s/log?wait=true", s.srv.URL, app.ID, hostID, jobID), nil)
-	c.Assert(err, IsNil)
-	req.SetBasicAuth("", authKey)
-	res, err = http.DefaultClient.Do(req)
-	var buf bytes.Buffer
-	_, err = buf.ReadFrom(res.Body)
-	res.Body.Close()
-	c.Assert(err, IsNil)
-
-	c.Assert(buf.String(), Equals, "foo")
-}
-
-func (s *S) TestJobLogTail(c *C) {
-	pipeR, pipeW := io.Pipe()
-	defer pipeW.Close()
-	app, hostID, jobID := s.createLogTestApp(c, "joblog-stream", pipeR)
-
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s/apps/%s/jobs/%s-%s/log?tail=true", s.srv.URL, app.ID, hostID, jobID), nil)
-	c.Assert(err, IsNil)
-	req.SetBasicAuth("", authKey)
-	res, err := http.DefaultClient.Do(req)
-	c.Assert(err, IsNil)
-	defer res.Body.Close()
-
-	data := []byte("test")
-	go pipeW.Write(data)
-	buf := make([]byte, 4)
-	_, err = res.Body.Read(buf)
-	c.Assert(err, IsNil)
-	c.Assert(buf, DeepEquals, data)
-}
-
-func (s *S) TestJobLogSSE(c *C) {
-	logData, err := base64.StdEncoding.DecodeString("AwIAAAANaGVsbG8gc3RkZXJyCgMBAAAADWhlbGxvIHN0ZG91dAoDAQAAABNMaXN0ZW5pbmcgb24gNTUwMTIKAwEAAAAAAwIAAAAA")
-	c.Assert(err, IsNil)
-	app, hostID, jobID := s.createLogTestApp(c, "joblog-sse", bytes.NewReader(logData))
-
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s/apps/%s/jobs/%s-%s/log", s.srv.URL, app.ID, hostID, jobID), nil)
-	c.Assert(err, IsNil)
-	req.SetBasicAuth("", authKey)
-	req.Header.Set("Accept", "text/event-stream")
-	res, err := http.DefaultClient.Do(req)
-	c.Assert(err, IsNil)
-
-	var buf bytes.Buffer
-	_, err = buf.ReadFrom(res.Body)
-	res.Body.Close()
-	c.Assert(err, IsNil)
-
-	expected := "data: {\"stream\":\"stderr\",\"data\":\"hello stderr\\n\"}\n\ndata: {\"stream\":\"stdout\",\"data\":\"hello stdout\\n\"}\n\ndata: {\"stream\":\"stdout\",\"data\":\"Listening on 55012\\n\"}\n\nevent: eof\ndata: {}\n\n"
-
-	c.Assert(buf.String(), Equals, expected)
-}
-
-func (s *S) TestJobLogSSEStream(c *C) {
-	pipeR, pipeW := io.Pipe()
-	defer pipeW.Close()
-	app, hostID, jobID := s.createLogTestApp(c, "joblog-sse-stream", pipeR)
-
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s/apps/%s/jobs/%s-%s/log?tail=true", s.srv.URL, app.ID, hostID, jobID), nil)
-	c.Assert(err, IsNil)
-	req.SetBasicAuth("", authKey)
-	req.Header.Set("Accept", "text/event-stream")
-	res, err := http.DefaultClient.Do(req)
-	c.Assert(err, IsNil)
-	defer res.Body.Close()
-
-	go pipeW.Write([]byte("\x03\x01\x00\x00\x00\x13Listening on 55012\n\x05\x00\x00\x00\x01"))
-	buf := &bytes.Buffer{}
-	buf.ReadFrom(res.Body)
-
-	expected := "data: {\"stream\":\"stdout\",\"data\":\"Listening on 55012\\n\"}\n\nevent: exit\ndata: {\"status\": 1}\n\n"
-	c.Assert(buf.String(), Equals, expected)
+	c.Assert(hc.IsStopped(jobID), Equals, true)
 }
 
 func (s *S) TestRunJobDetached(c *C) {
 	app := s.createTestApp(c, &ct.App{Name: "run-detached"})
+	artifact := s.createTestArtifact(c, &ct.Artifact{})
+	hostID := fakeHostID()
+	host := tu.NewFakeHostClient(hostID, false)
+	s.cc.AddHost(host)
 
-	hostID := random.UUID()
-	s.cc.SetHosts(map[string]host.Host{hostID: {}})
-
-	artifact := s.createTestArtifact(c, &ct.Artifact{Type: "docker", URI: "docker://foo/bar"})
-	release := s.createTestRelease(c, &ct.Release{
-		ArtifactID: artifact.ID,
-		Env:        map[string]string{"RELEASE": "true", "FOO": "bar"},
+	release := s.createTestRelease(c, app.ID, &ct.Release{
+		ArtifactIDs: []string{artifact.ID},
+		Env:         map[string]string{"RELEASE": "true", "FOO": "bar"},
 	})
 
-	cmd := []string{"foo", "bar"}
+	args := []string{"foo", "bar"}
 	req := &ct.NewJob{
-		ReleaseID: release.ID,
-		Cmd:       cmd,
-		Env:       map[string]string{"JOB": "true", "FOO": "baz"},
+		ReleaseID:  release.ID,
+		ReleaseEnv: true,
+		Args:       args,
+		Env:        map[string]string{"JOB": "true", "FOO": "baz"},
+		Meta:       map[string]string{"foo": "baz"},
 	}
-	res := &ct.Job{}
-	_, err := s.Post(fmt.Sprintf("/apps/%s/jobs", app.ID), req, res)
+	res, err := s.c.RunJobDetached(app.ID, req)
 	c.Assert(err, IsNil)
 	c.Assert(res.ID, Not(Equals), "")
 	c.Assert(res.ReleaseID, Equals, release.ID)
 	c.Assert(res.Type, Equals, "")
-	c.Assert(res.Cmd, DeepEquals, cmd)
+	c.Assert(res.Args, DeepEquals, args)
 
-	job := s.cc.GetHost(hostID).Jobs[0]
-	c.Assert(res.ID, Equals, hostID+"-"+job.ID)
-	c.Assert(job.Metadata, DeepEquals, map[string]string{
-		"flynn-controller.app":      app.ID,
-		"flynn-controller.app_name": app.Name,
-		"flynn-controller.release":  release.ID,
-	})
-	c.Assert(job.Config.Cmd, DeepEquals, []string{"foo", "bar"})
-	c.Assert(job.Config.Env, DeepEquals, map[string]string{"FOO": "baz", "JOB": "true", "RELEASE": "true"})
-	c.Assert(job.Config.Stdin, Equals, false)
+	jobs, err := host.ListJobs()
+	c.Assert(err, IsNil)
+	for _, j := range jobs {
+		job := j.Job
+		c.Assert(res.ID, Equals, job.ID)
+		c.Assert(job.Metadata, DeepEquals, map[string]string{
+			"flynn-controller.app":      app.ID,
+			"flynn-controller.app_name": app.Name,
+			"flynn-controller.release":  release.ID,
+			"foo": "baz",
+		})
+		c.Assert(job.Config.Args, DeepEquals, []string{"foo", "bar"})
+		c.Assert(job.Config.Env, DeepEquals, map[string]string{
+			"FLYNN_APP_ID":       app.ID,
+			"FLYNN_RELEASE_ID":   release.ID,
+			"FLYNN_PROCESS_TYPE": "",
+			"FLYNN_JOB_ID":       job.ID,
+			"FOO":                "baz",
+			"JOB":                "true",
+			"RELEASE":            "true",
+		})
+		c.Assert(job.Config.Stdin, Equals, false)
+	}
 }
 
 func (s *S) TestRunJobAttached(c *C) {
 	app := s.createTestApp(c, &ct.App{Name: "run-attached"})
-	hostID := random.UUID()
-	hc := tu.NewFakeHostClient(hostID)
+	hostID := fakeHostID()
+	hc := tu.NewFakeHostClient(hostID, false)
+	s.cc.AddHost(hc)
 
-	done := make(chan struct{})
+	input := make(chan string, 1)
 	var jobID string
 	hc.SetAttachFunc("*", func(req *host.AttachReq, wait bool) (cluster.AttachClient, error) {
 		c.Assert(wait, Equals, true)
@@ -244,60 +249,69 @@ func (s *S) TestRunJobAttached(c *C) {
 			Width:  10,
 		})
 		jobID = req.JobID
-		pipeR, pipeW := io.Pipe()
+		inPipeR, inPipeW := io.Pipe()
 		go func() {
-			stdin, err := ioutil.ReadAll(pipeR)
-			c.Assert(err, IsNil)
-			c.Assert(string(stdin), Equals, "test in")
-			close(done)
+			buf := make([]byte, 10)
+			n, _ := inPipeR.Read(buf)
+			input <- string(buf[:n])
 		}()
+		outPipeR, outPipeW := io.Pipe()
+		go outPipeW.Write([]byte("test out"))
 		return cluster.NewAttachClient(struct {
 			io.Reader
 			io.WriteCloser
-		}{strings.NewReader("test out"), pipeW}), nil
+		}{outPipeR, inPipeW}), nil
 	})
 
-	s.cc.SetHostClient(hostID, hc)
-	s.cc.SetHosts(map[string]host.Host{hostID: {}})
-
-	artifact := s.createTestArtifact(c, &ct.Artifact{Type: "docker", URI: "docker://foo/bar"})
-	release := s.createTestRelease(c, &ct.Release{
-		ArtifactID: artifact.ID,
-		Env:        map[string]string{"RELEASE": "true", "FOO": "bar"},
+	artifact := s.createTestArtifact(c, &ct.Artifact{})
+	release := s.createTestRelease(c, app.ID, &ct.Release{
+		ArtifactIDs: []string{artifact.ID},
+		Env:         map[string]string{"RELEASE": "true", "FOO": "bar"},
 	})
 
-	data, _ := json.Marshal(&ct.NewJob{
-		ReleaseID: release.ID,
-		Cmd:       []string{"foo", "bar"},
-		Env:       map[string]string{"JOB": "true", "FOO": "baz"},
-		TTY:       true,
-		Columns:   10,
-		Lines:     20,
-	})
-	req, err := http.NewRequest("POST", s.srv.URL+"/apps/"+app.ID+"/jobs", bytes.NewBuffer(data))
-	c.Assert(err, IsNil)
-	req.SetBasicAuth("", authKey)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/vnd.flynn.attach")
-	_, rwc, err := utils.HijackRequest(req, nil)
+	data := &ct.NewJob{
+		ReleaseID:  release.ID,
+		ReleaseEnv: true,
+		Args:       []string{"foo", "bar"},
+		Env:        map[string]string{"JOB": "true", "FOO": "baz"},
+		Meta:       map[string]string{"foo": "baz"},
+		TTY:        true,
+		Columns:    10,
+		Lines:      20,
+	}
+	rwc, err := s.c.RunJobAttached(app.ID, data)
 	c.Assert(err, IsNil)
 
 	_, err = rwc.Write([]byte("test in"))
 	c.Assert(err, IsNil)
-	rwc.CloseWrite()
-	stdout, err := ioutil.ReadAll(rwc)
+	c.Assert(<-input, Equals, "test in")
+	buf := make([]byte, 10)
+	n, _ := rwc.Read(buf)
 	c.Assert(err, IsNil)
-	c.Assert(string(stdout), Equals, "test out")
+	c.Assert(string(buf[:n]), Equals, "test out")
 	rwc.Close()
 
-	job := s.cc.GetHost(hostID).Jobs[0]
-	c.Assert(job.ID, Equals, jobID)
-	c.Assert(job.Metadata, DeepEquals, map[string]string{
-		"flynn-controller.app":      app.ID,
-		"flynn-controller.app_name": app.Name,
-		"flynn-controller.release":  release.ID,
-	})
-	c.Assert(job.Config.Cmd, DeepEquals, []string{"foo", "bar"})
-	c.Assert(job.Config.Env, DeepEquals, map[string]string{"FOO": "baz", "JOB": "true", "RELEASE": "true"})
-	c.Assert(job.Config.Stdin, Equals, true)
+	jobs, err := hc.ListJobs()
+	c.Assert(err, IsNil)
+	for _, j := range jobs {
+		job := j.Job
+		c.Assert(job.ID, Equals, jobID)
+		c.Assert(job.Metadata, DeepEquals, map[string]string{
+			"flynn-controller.app":      app.ID,
+			"flynn-controller.app_name": app.Name,
+			"flynn-controller.release":  release.ID,
+			"foo": "baz",
+		})
+		c.Assert(job.Config.Args, DeepEquals, []string{"foo", "bar"})
+		c.Assert(job.Config.Env, DeepEquals, map[string]string{
+			"FLYNN_APP_ID":       app.ID,
+			"FLYNN_RELEASE_ID":   release.ID,
+			"FLYNN_PROCESS_TYPE": "",
+			"FLYNN_JOB_ID":       job.ID,
+			"FOO":                "baz",
+			"JOB":                "true",
+			"RELEASE":            "true",
+		})
+		c.Assert(job.Config.Stdin, Equals, true)
+	}
 }

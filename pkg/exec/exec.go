@@ -7,22 +7,35 @@ import (
 	"io"
 	"io/ioutil"
 
+	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/flynn/controller/utils"
+	"github.com/flynn/flynn/host/resource"
 	"github.com/flynn/flynn/host/types"
 	"github.com/flynn/flynn/pkg/cluster"
+	"github.com/flynn/flynn/pkg/schedutil"
+	"github.com/flynn/flynn/pkg/stream"
+	"github.com/opencontainers/runc/libcontainer/configs"
 )
 
 type Cmd struct {
-	HostID string
-	JobID  string
-	TTY    bool
-	Meta   map[string]string
+	Job *host.Job
 
-	Entrypoint []string
+	TTY  bool
+	Meta map[string]string
 
-	Artifact host.Artifact
+	Args []string
 
-	Cmd []string
+	ImageArtifact *ct.Artifact
+
 	Env map[string]string
+
+	Volumes    []*ct.VolumeReq
+	Mounts     []host.Mount
+	Resources  resource.Resources
+	WorkingDir string
+
+	HostNetwork      bool
+	HostPIDNamespace bool
 
 	Stdin io.Reader
 
@@ -31,46 +44,90 @@ type Cmd struct {
 
 	TermHeight, TermWidth uint16
 
-	started      bool
-	finished     bool
-	cluster      ClusterClient
-	closeCluster bool
-	attachClient cluster.AttachClient
-	streamErr    error
-	exitStatus   int
+	LinuxCapabilities []string
+	AllowedDevices    []*configs.Device
 
+	// cluster is used to communicate with the layer 0 cluster
+	cluster ClusterClient
+
+	// Host is used to communicate with the host that the job will run on
+	Host *cluster.Host
+
+	// started is true if Start has been called
+	started bool
+
+	// finished is true if Wait has been called
+	finished bool
+
+	// closeCluster indicates that cluster should be closed after the job
+	// finishes, it is set if the cluster connection was created by Start
+	closeCluster bool
+
+	// attachClient connects to the job's io streams and is also used to
+	// retrieve the job's exit status if any of Stdin, Stdout, or Stderr are
+	// specified
+	attachClient cluster.AttachClient
+
+	// eventChan is used to get job events (including the exit status) from the
+	// host if no io streams are attached
+	eventChan chan *host.Event
+
+	// eventStream allows closing eventChan and checking for connection errors,
+	// it is only set if eventChan is set
+	eventStream stream.Stream
+
+	// streamErr is set if an error is received from attachClient or
+	// eventStream, it supercedes a non-zero exitStatus
+	streamErr error
+
+	// exitStatus is the job's exit status
+	exitStatus int
+
+	// closeAfterWait lists connections that should be closed before Wait returns
 	closeAfterWait []io.Closer
 
-	host cluster.Host
+	// done is closed after the job exits or fails
 	done chan struct{}
 
+	// stdinPipe is set if StdinPipe is called, and holds a readyWriter that
+	// blocks until stdin has been attached to the job
 	stdinPipe *readyWriter
 }
 
-func DockerImage(name, id string) host.Artifact {
-	a := host.Artifact{
-		Type: "docker",
-		URI:  "https://registry.hub.docker.com/" + name,
-	}
-	if id != "" {
-		a.URI += "?id=" + id
-	}
-	return a
+func Command(artifact *ct.Artifact, args ...string) *Cmd {
+	return &Cmd{ImageArtifact: artifact, Args: args}
 }
 
-func Command(artifact host.Artifact, cmd ...string) *Cmd {
-	return &Cmd{Artifact: artifact, Cmd: cmd, done: make(chan struct{})}
+func Job(artifact *ct.Artifact, job *host.Job) *Cmd {
+	return &Cmd{ImageArtifact: artifact, Job: job}
 }
 
 type ClusterClient interface {
-	ListHosts() (map[string]host.Host, error)
-	AddJobs(*host.AddJobsReq) (*host.AddJobsRes, error)
-	DialHost(string) (cluster.Host, error)
+	Hosts() ([]*cluster.Host, error)
+	Host(string) (*cluster.Host, error)
 }
 
-func CommandUsingCluster(c ClusterClient, artifact host.Artifact, cmd ...string) *Cmd {
-	command := Command(artifact, cmd...)
+func CommandUsingCluster(c ClusterClient, artifact *ct.Artifact, args ...string) *Cmd {
+	command := Command(artifact, args...)
 	command.cluster = c
+	return command
+}
+
+func CommandUsingHost(h *cluster.Host, artifact *ct.Artifact, args ...string) *Cmd {
+	command := Command(artifact, args...)
+	command.Host = h
+	return command
+}
+
+func JobUsingCluster(c ClusterClient, artifact *ct.Artifact, job *host.Job) *Cmd {
+	command := Job(artifact, job)
+	command.cluster = c
+	return command
+}
+
+func JobUsingHost(h *cluster.Host, artifact *ct.Artifact, job *host.Job) *Cmd {
+	command := Job(artifact, job)
+	command.Host = h
 	return command
 }
 
@@ -115,51 +172,77 @@ func (c *Cmd) Start() error {
 	if c.started {
 		return errors.New("exec: already started")
 	}
+	c.done = make(chan struct{})
 	c.started = true
-	if c.cluster == nil {
+	if c.Host == nil && c.cluster == nil {
 		var err error
-		c.cluster, err = cluster.NewClient()
+		c.cluster = cluster.NewClient()
 		if err != nil {
 			return err
 		}
 		c.closeCluster = true
 	}
 
-	hosts, err := c.cluster.ListHosts()
-	if err != nil {
-		return err
+	if c.Host == nil {
+		hosts, err := c.cluster.Hosts()
+		if err != nil {
+			return err
+		}
+		if len(hosts) == 0 {
+			return errors.New("exec: no hosts found")
+		}
+		c.Host = schedutil.PickHost(hosts)
 	}
-	if c.HostID == "" {
-		// TODO: check if this is actually random
-		for c.HostID = range hosts {
-			break
+
+	// Use the pre-defined host.Job configuration if provided;
+	// otherwise generate one from the fields on exec.Cmd that mirror stdlib's os.exec.
+	if c.Job == nil {
+		c.Job = &host.Job{
+			Config: host.ContainerConfig{
+				Args:             c.Args,
+				TTY:              c.TTY,
+				Env:              c.Env,
+				Stdin:            c.Stdin != nil || c.stdinPipe != nil,
+				HostNetwork:      c.HostNetwork,
+				HostPIDNamespace: c.HostPIDNamespace,
+				Mounts:           c.Mounts,
+				WorkingDir:       c.WorkingDir,
+			},
+			Resources: c.Resources,
+			Metadata:  c.Meta,
+		}
+		// if attaching to stdout / stderr, avoid round tripping the
+		// streams via on-disk log files.
+		if c.Stdout != nil || c.Stderr != nil {
+			c.Job.Config.DisableLog = true
 		}
 	}
-	if c.JobID == "" {
-		c.JobID = cluster.RandomJobID("")
+	if c.Job.ID == "" {
+		c.Job.ID = cluster.GenerateJobID(c.Host.ID(), "")
 	}
 
-	job := &host.Job{
-		ID:       c.JobID,
-		Artifact: c.Artifact,
-		Config: host.ContainerConfig{
-			Entrypoint: c.Entrypoint,
-			Cmd:        c.Cmd,
-			TTY:        c.TTY,
-			Env:        c.Env,
-			Stdin:      c.Stdin != nil || c.stdinPipe != nil,
-		},
-		Metadata: c.Meta,
+	if len(c.LinuxCapabilities) > 0 {
+		c.Job.Config.LinuxCapabilities = &c.LinuxCapabilities
+	}
+	if len(c.AllowedDevices) > 0 {
+		c.Job.Config.AllowedDevices = &c.AllowedDevices
 	}
 
-	c.host, err = c.cluster.DialHost(c.HostID)
-	if err != nil {
-		return err
+	for _, vol := range c.Volumes {
+		if _, err := utils.ProvisionVolume(vol, c.Host, c.Job); err != nil {
+			return err
+		}
+	}
+
+	resource.SetDefaults(&c.Job.Resources)
+
+	if c.ImageArtifact != nil {
+		utils.SetupMountspecs(c.Job, []*ct.Artifact{c.ImageArtifact})
 	}
 
 	if c.Stdout != nil || c.Stderr != nil || c.Stdin != nil || c.stdinPipe != nil {
 		req := &host.AttachReq{
-			JobID:  job.ID,
+			JobID:  c.Job.ID,
 			Height: c.TermHeight,
 			Width:  c.TermWidth,
 			Flags:  host.AttachFlagStream,
@@ -170,10 +253,11 @@ func (c *Cmd) Start() error {
 		if c.Stderr != nil {
 			req.Flags |= host.AttachFlagStderr
 		}
-		if job.Config.Stdin {
+		if c.Job.Config.Stdin {
 			req.Flags |= host.AttachFlagStdin
 		}
-		c.attachClient, err = c.host.Attach(req, true)
+		var err error
+		c.attachClient, err = c.Host.Attach(req, true)
 		if err != nil {
 			c.close()
 			return err
@@ -188,24 +272,45 @@ func (c *Cmd) Start() error {
 			c.attachClient.CloseWrite()
 		}()
 	}
+
+	if c.attachClient == nil {
+		c.eventChan = make(chan *host.Event)
+		var err error
+		c.eventStream, err = c.Host.StreamEvents(c.Job.ID, c.eventChan)
+		if err != nil {
+			return err
+		}
+	}
+
 	go func() {
-		c.exitStatus, c.streamErr = c.attachClient.Receive(c.Stdout, c.Stderr)
-		close(c.done)
+		defer close(c.done)
+		if c.attachClient != nil {
+			c.exitStatus, c.streamErr = c.attachClient.Receive(c.Stdout, c.Stderr)
+		} else {
+		outer:
+			for e := range c.eventChan {
+				switch e.Event {
+				case "stop":
+					c.exitStatus = *e.Job.ExitStatus
+					break outer
+				case "error":
+					c.streamErr = errors.New(*e.Job.Error)
+					break outer
+				}
+			}
+			c.eventStream.Close()
+			if c.streamErr == nil {
+				c.streamErr = c.eventStream.Err()
+			}
+		}
 	}()
 
-	_, err = c.cluster.AddJobs(&host.AddJobsReq{HostJobs: map[string][]*host.Job{c.HostID: {job}}})
-	return err
+	return c.Host.AddJob(c.Job)
 }
 
 func (c *Cmd) close() {
 	if c.attachClient != nil {
 		c.attachClient.Close()
-	}
-	if c.host != nil {
-		c.host.Close()
-	}
-	if c.closeCluster {
-		c.cluster.(*cluster.Client).Close()
 	}
 }
 
@@ -240,7 +345,7 @@ func (c *Cmd) Kill() error {
 	if !c.started {
 		return errors.New("exec: not started")
 	}
-	return c.host.StopJob(c.JobID)
+	return c.Host.StopJob(c.Job.ID)
 }
 
 func (c *Cmd) Run() error {
@@ -279,18 +384,12 @@ func (c *Cmd) Signal(sig int) error {
 	if !c.started {
 		return errors.New("exec: not started")
 	}
-	if c.finished {
-		return errors.New("exec: already finished")
-	}
 	return c.attachClient.Signal(sig)
 }
 
 func (c *Cmd) ResizeTTY(height, width uint16) error {
 	if !c.started {
 		return errors.New("exec: not started")
-	}
-	if c.finished {
-		return errors.New("exec: already finished")
 	}
 	return c.attachClient.ResizeTTY(height, width)
 }

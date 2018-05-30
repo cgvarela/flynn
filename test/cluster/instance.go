@@ -10,13 +10,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"syscall"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/code.google.com/p/go.crypto/ssh"
 	"github.com/flynn/flynn/pkg/attempt"
 	"github.com/flynn/flynn/pkg/random"
+	"golang.org/x/crypto/ssh"
 )
 
 func NewVMManager(bridge *Bridge) *VMManager {
@@ -24,19 +24,19 @@ func NewVMManager(bridge *Bridge) *VMManager {
 }
 
 type VMManager struct {
-	taps   *TapManager
-	nextID uint64
+	taps *TapManager
 }
 
 type VMConfig struct {
-	Kernel string
-	User   int
-	Group  int
-	Memory string
-	Cores  int
-	Drives map[string]*VMDrive
-	Args   []string
-	Out    io.Writer
+	Kernel     string
+	User       int
+	Group      int
+	Memory     string
+	Cores      int
+	Drives     map[string]*VMDrive
+	Args       []string
+	Out        io.Writer `json:"-"`
+	BackupsDir string
 
 	netFS string
 }
@@ -47,54 +47,50 @@ type VMDrive struct {
 	Temp bool
 }
 
-func (v *VMManager) NewInstance(c *VMConfig) (Instance, error) {
-	id := atomic.AddUint64(&v.nextID, 1) - 1
-	inst := &vm{
-		ID:       fmt.Sprintf("flynn%d", id),
-		VMConfig: c,
-	}
+func (v *VMManager) NewInstance(c *VMConfig) (*Instance, error) {
+	inst := &Instance{ID: random.String(8), VMConfig: c}
 	if c.Kernel == "" {
 		c.Kernel = "vmlinuz"
 	}
 	if c.Out == nil {
 		var err error
-		c.Out, err = os.Create(inst.ID + ".log")
+		c.Out, err = os.Create("flynn-" + inst.ID + ".log")
 		if err != nil {
 			return nil, err
 		}
 	}
 	var err error
 	inst.tap, err = v.taps.NewTap(c.User, c.Group)
-	return inst, err
+	if err != nil {
+		return nil, err
+	}
+	inst.IP = inst.tap.IP.String()
+	return inst, nil
 }
 
-type Instance interface {
-	DialSSH() (*ssh.Client, error)
-	Start() error
-	Wait(time.Duration) error
-	Shutdown() error
-	Kill() error
-	IP() string
-	Run(string, *Streams) error
-	Drive(string) *VMDrive
-}
+type Instance struct {
+	ID string `json:"id"`
+	IP string `json:"ip"`
 
-type vm struct {
-	ID string
 	*VMConfig
 	tap *Tap
 	cmd *exec.Cmd
 
 	tempFiles []string
+
+	sshMtx sync.RWMutex
+	ssh    *ssh.Client
+
+	initial bool
 }
 
-func (v *vm) writeInterfaceConfig() error {
+func (i *Instance) writeInterfaceConfig() error {
 	dir, err := ioutil.TempDir("", "netfs-")
 	if err != nil {
 		return err
 	}
-	v.tempFiles = append(v.tempFiles, dir)
-	v.netFS = dir
+	i.tempFiles = append(i.tempFiles, dir)
+	i.netFS = dir
 
 	if err := os.Chmod(dir, 0755); err != nil {
 		os.RemoveAll(dir)
@@ -108,74 +104,82 @@ func (v *vm) writeInterfaceConfig() error {
 	}
 	defer f.Close()
 
-	return v.tap.WriteInterfaceConfig(f)
+	return i.tap.WriteInterfaceConfig(f)
 }
 
-func (v *vm) cleanup() {
-	for _, f := range v.tempFiles {
+func (i *Instance) cleanup() {
+	for _, f := range i.tempFiles {
+		fmt.Printf("removing temp file %s\n", f)
 		if err := os.RemoveAll(f); err != nil {
 			fmt.Printf("could not remove temp file %s: %s\n", f, err)
 		}
 	}
-	if err := v.tap.Close(); err != nil {
-		fmt.Printf("could not close tap device %s: %s\n", v.tap.Name, err)
+	if err := i.tap.Close(); err != nil {
+		fmt.Printf("could not close tap device %s: %s\n", i.tap.Name, err)
 	}
-	v.tempFiles = nil
+	i.tempFiles = nil
+
+	i.sshMtx.Lock()
+	defer i.sshMtx.Unlock()
+	if i.ssh != nil {
+		i.ssh.Close()
+	}
 }
 
-func (v *vm) Start() error {
-	v.writeInterfaceConfig()
+func (i *Instance) Start() error {
+	i.writeInterfaceConfig()
 
 	macRand := random.Bytes(3)
 	macaddr := fmt.Sprintf("52:54:00:%02x:%02x:%02x", macRand[0], macRand[1], macRand[2])
 
-	v.Args = append(v.Args,
+	i.Args = append(i.Args,
 		"-enable-kvm",
-		"-kernel", v.Kernel,
-		"-append", `"root=/dev/sda"`,
-		"-net", "nic,macaddr="+macaddr,
-		"-net", "tap,ifname="+v.tap.Name+",script=no,downscript=no",
-		"-virtfs", "fsdriver=local,path="+v.netFS+",security_model=passthrough,readonly,mount_tag=netfs",
+		"-kernel", i.Kernel,
+		"-append", "root=/dev/sda net.ifnames=0",
+		"-netdev", "tap,id=vmnic,ifname="+i.tap.Name+",script=no,downscript=no",
+		"-device", "virtio-net,netdev=vmnic,mac="+macaddr,
+		"-virtfs", "fsdriver=local,path="+i.netFS+",security_model=passthrough,readonly,mount_tag=netfs",
+		"-virtfs", "fsdriver=local,path="+i.BackupsDir+",security_model=passthrough,readonly,mount_tag=backupsfs",
 		"-nographic",
 	)
-	if v.Memory != "" {
-		v.Args = append(v.Args, "-m", v.Memory)
+	if i.Memory != "" {
+		i.Args = append(i.Args, "-m", i.Memory)
 	}
-	if v.Cores > 0 {
-		v.Args = append(v.Args, "-smp", strconv.Itoa(v.Cores))
+	if i.Cores > 0 {
+		i.Args = append(i.Args, "-smp", strconv.Itoa(i.Cores))
 	}
-	var err error
-	for i, d := range v.Drives {
+	for n, d := range i.Drives {
 		if d.COW {
-			fs, err := v.createCOW(d.FS, d.Temp)
+			fs, err := i.createCOW(d.FS, d.Temp)
 			if err != nil {
-				v.cleanup()
+				i.cleanup()
 				return err
 			}
 			d.FS = fs
 		}
-		v.Args = append(v.Args, fmt.Sprintf("-%s", i), d.FS)
+		i.Args = append(i.Args, fmt.Sprintf("-%s", n), d.FS)
 	}
 
-	v.cmd = exec.Command("sudo", append([]string{"-u", fmt.Sprintf("#%d", v.User), "-g", fmt.Sprintf("#%d", v.Group), "-H", "/usr/bin/qemu-system-x86_64"}, v.Args...)...)
-	v.cmd.Stdout = v.Out
-	v.cmd.Stderr = v.Out
-	if err = v.cmd.Start(); err != nil {
-		v.cleanup()
+	i.cmd = exec.Command("sudo", append([]string{"-u", fmt.Sprintf("#%d", i.User), "-g", fmt.Sprintf("#%d", i.Group), "-H", "/usr/bin/qemu-system-x86_64"}, i.Args...)...)
+	i.cmd.Stdout = i.Out
+	i.cmd.Stderr = i.Out
+	var err error
+	if err = i.cmd.Start(); err != nil {
+		i.cleanup()
 	}
 	return err
 }
 
-func (v *vm) createCOW(image string, temp bool) (string, error) {
+func (i *Instance) createCOW(image string, temp bool) (string, error) {
 	name := strings.TrimSuffix(filepath.Base(image), filepath.Ext(image))
 	dir, err := ioutil.TempDir("", name+"-")
 	if err != nil {
 		return "", err
 	}
 	if temp {
-		v.tempFiles = append(v.tempFiles, dir)
+		i.tempFiles = append(i.tempFiles, dir)
 	}
-	if err := os.Chown(dir, v.User, v.Group); err != nil {
+	if err := os.Chown(dir, i.User, i.Group); err != nil {
 		return "", err
 	}
 	path := filepath.Join(dir, "rootfs.img")
@@ -183,16 +187,16 @@ func (v *vm) createCOW(image string, temp bool) (string, error) {
 	if err = cmd.Run(); err != nil {
 		return "", fmt.Errorf("failed to create COW filesystem: %s", err.Error())
 	}
-	if err := os.Chown(path, v.User, v.Group); err != nil {
+	if err := os.Chown(path, i.User, i.Group); err != nil {
 		return "", err
 	}
 	return path, nil
 }
 
-func (v *vm) Wait(timeout time.Duration) error {
+func (i *Instance) Wait(timeout time.Duration) error {
 	done := make(chan error)
 	go func() {
-		done <- v.cmd.Wait()
+		done <- i.cmd.Wait()
 	}()
 	select {
 	case err := <-done:
@@ -202,71 +206,119 @@ func (v *vm) Wait(timeout time.Duration) error {
 	}
 }
 
-func (v *vm) Shutdown() error {
-	if err := v.Run("sudo poweroff", nil); err != nil {
-		return v.Kill()
+func (i *Instance) Shutdown() error {
+	if err := i.Run("sudo poweroff", nil); err != nil {
+		return i.Kill()
 	}
-	if err := v.Wait(5 * time.Second); err != nil {
-		return v.Kill()
+	if err := i.Wait(30 * time.Second); err != nil {
+		return i.Kill()
 	}
-	v.cleanup()
+	i.cleanup()
 	return nil
 }
 
-func (v *vm) Kill() error {
-	defer v.cleanup()
-	if err := v.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+func (i *Instance) Kill() error {
+	defer i.cleanup()
+	if err := i.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		return err
 	}
-	if err := v.Wait(5 * time.Second); err != nil {
-		return v.cmd.Process.Kill()
+	if err := i.Wait(5 * time.Second); err != nil {
+		return i.cmd.Process.Kill()
 	}
 	return nil
 }
 
-func (v *vm) DialSSH() (*ssh.Client, error) {
-	return ssh.Dial("tcp", v.IP()+":22", &ssh.ClientConfig{
-		User: "ubuntu",
-		Auth: []ssh.AuthMethod{ssh.Password("ubuntu")},
-	})
-}
+func (i *Instance) dialSSH(stderr io.Writer) error {
+	if i.ssh != nil {
+		return nil
+	}
 
-func (v *vm) IP() string {
-	return v.tap.RemoteIP.String()
+	i.sshMtx.RUnlock()
+	i.sshMtx.Lock()
+	defer i.sshMtx.RLock()
+	defer i.sshMtx.Unlock()
+
+	if i.ssh != nil {
+		return nil
+	}
+
+	var sc *ssh.Client
+	err := sshAttempts.Run(func() (err error) {
+		if stderr != nil {
+			fmt.Fprintf(stderr, "Attempting to ssh to %s:22...\n", i.IP)
+		}
+		sc, err = ssh.Dial("tcp", i.IP+":22", &ssh.ClientConfig{
+			User: "ubuntu",
+			Auth: []ssh.AuthMethod{ssh.Password("ubuntu")},
+		})
+		return
+	})
+	if sc != nil {
+		i.ssh = sc
+	}
+	return err
 }
 
 var sshAttempts = attempt.Strategy{
 	Min:   5,
-	Total: 5 * time.Minute,
+	Total: 30 * time.Second,
 	Delay: time.Second,
 }
 
-func (v *vm) Run(command string, s *Streams) error {
+func (i *Instance) Run(command string, s *Streams) error {
+	return i.run(command, s, nil, nil)
+}
+
+func (i *Instance) RunWithEnv(command string, s *Streams, env map[string]string) error {
+	return i.run(command, s, env, nil)
+}
+
+func (i *Instance) RunWithTimeout(command string, s *Streams, timeout time.Duration) error {
+	return i.run(command, s, nil, &timeout)
+}
+
+func (i *Instance) run(command string, s *Streams, env map[string]string, timeout *time.Duration) (err error) {
 	if s == nil {
 		s = &Streams{}
 	}
-	var sc *ssh.Client
-	err := sshAttempts.Run(func() (err error) {
-		if s.Stderr != nil {
-			fmt.Fprintf(s.Stderr, "Attempting to ssh to %s:22...\n", v.IP())
-		}
-		sc, err = v.DialSSH()
-		return
-	})
+
+	i.sshMtx.RLock()
+	defer i.sshMtx.RUnlock()
+	if err := i.dialSSH(s.Stderr); err != nil {
+		return err
+	}
+
+	sess, err := i.ssh.NewSession()
 	if err != nil {
 		return err
 	}
-	defer sc.Close()
-	sess, err := sc.NewSession()
+	defer sess.Close()
 	sess.Stdin = s.Stdin
 	sess.Stdout = s.Stdout
 	sess.Stderr = s.Stderr
-	if err := sess.Run(command); err != nil {
-		return fmt.Errorf("failed to run command on %s: %s", v.IP(), err)
+	for k, v := range env {
+		sess.Setenv(k, v)
 	}
-	return nil
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("failed to run command on %s: %s", i.IP, err)
+		}
+	}()
+	if timeout == nil {
+		return sess.Run(command)
+	}
+	runErr := make(chan error)
+	go func() {
+		runErr <- sess.Run(command)
+	}()
+	select {
+	case err = <-runErr:
+		return err
+	case <-time.After(*timeout):
+		return errors.New("command timed out")
+	}
 }
 
-func (v *vm) Drive(name string) *VMDrive {
-	return v.Drives[name]
+func (i *Instance) Drive(name string) *VMDrive {
+	return i.Drives[name]
 }

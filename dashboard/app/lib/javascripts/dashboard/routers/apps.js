@@ -1,88 +1,133 @@
-//= require ../dispatcher
-//= require ../views/app
-//= require ../views/app-env
-//= require ../views/app-logs
-//= require ../views/app-delete
-//= require ../views/app-route-new
-//= require ../views/app-route-delete
-//= require ../views/app-deploy-commit
+import Router from 'marbles/router';
+import { extend, assertEqual } from 'marbles/utils';
+import { pathWithParams } from 'marbles/history';
+import QueryParams from 'marbles/query_params';
+import State from 'marbles/state';
+import Dispatcher from '../dispatcher';
+import Config from '../config';
+import GithubPullsStore from '../stores/github-pulls';
+import GithubCommitsStore from '../stores/github-commits';
+import GithubBranchesStore from '../stores/github-branches';
+import AppsComponent from '../views/apps';
+import AppEnvComponent from '../views/app-env';
+import AppDeleteComponent from '../views/app-delete';
+import AppResourceProvisioner from '../views/app-resource-provisioner';
+import ResourceDeleteComponent from '../views/resource-delete';
+import NewAppRouteComponent from '../views/app-route-new';
+import AppRouteDeleteComponent from '../views/app-route-delete';
+import AppDeployCommitComponent from '../views/app-deploy-commit';
+import AppDeployEventComponent from '../views/app-deploy-event';
+import AppLogsComponent from '../views/app-logs';
+import DeployAppEventStore from '../stores/deploy-app-event';
 
-(function () {
-
-"use strict";
-
-var assertEqual = Marbles.Utils.assertEqual.bind(Marbles.Utils);
-
-Dashboard.routers.Apps = Marbles.Router.createClass({
-	displayName: "routers.apps",
-
+var AppsRouter = Router.createClass({
 	routes: [
-		{ path: "apps/:id", handler: "app", paramChangeScrollReset: false },
-		{ path: "apps/:id/env", handler: "appEnv", secondary: true },
-		{ path: "apps/:id/logs", handler: "appLogs", secondary: true },
-		{ path: "apps/:id/delete", handler: "appDelete", secondary: true },
-		{ path: "apps/:id/routes/new", handler: "newAppRoute", secondary: true },
-		{ path: "apps/:id/routes/:route/delete", handler: "appRouteDelete", secondary: true },
-		{ path: "apps/:id/deploy/:owner/:repo/:branch/:sha", handler: "appDeployCommit", secondary: true }
+		{ path: "apps", handler: "apps" },
+		{ path: "apps/:id", handler: "app", paramChangeScrollReset: false, app: true },
+		{ path: "apps/:id/env", handler: "appEnv", secondary: true, app: true },
+		{ path: "apps/:id/logs", handler: "appLogs", app: true },
+		{ path: "apps/:id/delete", handler: "appDelete", secondary: true, app: true },
+		{ path: "apps/:id/resources/new", handler: "newAppResource", secondary: true, app: true },
+		{ path: "apps/:id/providers/:providerID/resources/:resourceID/delete", handler: "appResourceDelete", secondary: true, app: true },
+		{ path: "apps/:id/routes/new", handler: "newAppRoute", secondary: true, app: true },
+		{ path: "apps/:id/routes/:type/:route/delete", handler: "appRouteDelete", secondary: true, app: true },
+		{ path: "apps/:id/deploy/:owner/:repo/:branch/:sha", handler: "appDeployCommit", secondary: true, app: true },
+		{ path: "apps/:id/deploy/:event", handler: "appDeployEvent", secondary: true, app: true }
 	],
 
-	beforeHandlerUnlaod: function (event) {
+	mixins: [State],
+
+	willInitialize: function () {
+		this.dispatcherIndex = Dispatcher.register(this.handleEvent.bind(this));
+		this.state = {};
+		this.__changeListeners = []; // always empty
+	},
+
+	beforeHandlerUnload: function (event) {
 		// prevent commits/branches/pulls stores from expiring
 		// when switching between source history tabs on the app page
 		// and allow them to expire when navigating away
-		var view = Dashboard.primaryView;
+		var view = this.context.primaryView;
 		if (view && view.isMounted() && view.constructor.displayName === "Views.App") {
-			var app = view.state.app;
-			var appMeta = app ? app.meta : null;
-			if (app && appMeta) {
+			var release = view.state.release;
+			var meta = release ? release.meta : null;
+			if (release && meta) {
 				if (event.nextHandler.router === this) {
 					if (view.props.selectedTab !== event.nextParams[0].shtab) {
 						if (view.props.selectedTab === "pulls") {
-							Dashboard.Stores.GithubPulls.expectChangeListener({
-								ownerLogin: appMeta.user_login,
-								repoName: appMeta.repo_name
+							GithubPullsStore.expectChangeListener({
+								ownerLogin: meta.github_user,
+								repoName: meta.github_repo
 							});
 						} else if (event.nextParams[0].shtab === "pulls") {
-							Dashboard.Stores.GithubCommits.expectChangeListener({
-								ownerLogin: appMeta.user_login,
-								repoName: appMeta.repo_name,
-								branch: view.props.selectedBranchName || appMeta.ref
+							GithubCommitsStore.expectChangeListener({
+								ownerLogin: meta.github_user,
+								repoName: meta.github_repo,
+								branch: view.props.selectedBranchName || meta.branch
 							});
-							Dashboard.Stores.GithubBranches.expectChangeListener({
-								ownerLogin: appMeta.user_login,
-								repoName: appMeta.repo_name
+							GithubBranchesStore.expectChangeListener({
+								ownerLogin: meta.github_user,
+								repoName: meta.github_repo
 							});
 						}
 					}
 				} else {
-					Dashboard.Stores.GithubPulls.unexpectChangeListener({
-						ownerLogin: appMeta.user_login,
-						repoName: appMeta.repo_name
+					GithubPullsStore.unexpectChangeListener({
+						ownerLogin: meta.github_user,
+						repoName: meta.github_repo
 					});
-					Dashboard.Stores.GithubCommits.unexpectChangeListener({
-						ownerLogin: appMeta.user_login,
-						repoName: appMeta.repo_name,
-						branch: view.props.selectedBranchName || appMeta.ref
+					GithubCommitsStore.unexpectChangeListener({
+						ownerLogin: meta.github_user,
+						repoName: meta.github_repo,
+						branch: view.props.selectedBranchName || meta.branch
 					});
-					Dashboard.Stores.GithubBranches.unexpectChangeListener({
-						ownerLogin: appMeta.user_login,
-						repoName: appMeta.repo_name
+					GithubBranchesStore.unexpectChangeListener({
+						ownerLogin: meta.github_user,
+						repoName: meta.github_repo
 					});
 				}
 			}
 		}
 	},
 
-	app: function (params) {
-		var view = Dashboard.primaryView;
-		var props = this.__getAppProps(params);
-		if (view && view.isMounted() && view.constructor.displayName === "Views.App") {
+	apps: function (params) {
+		var view = this.context.primaryView;
+		var props = this.__getAppsProps(params);
+		if (view && view.isMounted() && view.constructor.displayName === "Views.Apps") {
 			view.setProps(props);
 		} else {
-			Dashboard.primaryView = view = React.renderComponent(
-				Dashboard.Views.App(props),
-				Dashboard.el);
+			this.context.primaryView = view = React.render(React.createElement(
+				AppsComponent, props), this.context.el);
+		}
+	},
+
+	__getAppsProps: function (params) {
+		var appProps = this.__getAppProps(params);
+		var showSystemApps = params[0].system === "true";
+		var defaultRouteDomain = Config.default_route_domain;
+		var getAppPath = function (appId) {
+			var __params = extend({}, params[0]);
+			delete __params.id;
+			return this.__getAppPath(appId, __params, "");
+		}.bind(this);
+		return {
+			showSystemApps: showSystemApps,
+			defaultRouteDomain: defaultRouteDomain,
+			appProps: appProps,
+			appsListProps: {
+				selectedAppId: appProps.appId,
+				getAppPath: getAppPath,
+				defaultRouteDomain: defaultRouteDomain,
+				showSystemApps: showSystemApps
+			},
+			appsListHeaderProps: {
+				githubAuthed: !!Config.githubClient
 			}
+		};
+	},
+
+	app: function (params) {
+		this.apps(params);
 	},
 
 	__getAppProps: function (params) {
@@ -91,7 +136,7 @@ Dashboard.routers.Apps = Marbles.Router.createClass({
 			appId: params.id,
 			selectedTab: params.shtab || null,
 			getAppPath: function (subpath, subpathParams) {
-				var __params = Marbles.QueryParams.replaceParams.apply(null, [[Marbles.Utils.extend({}, params)]].concat(subpathParams || []));
+				var __params = QueryParams.replaceParams.apply(null, [[extend({}, params)]].concat(subpathParams || []));
 				return this.__getAppPath(params.id, __params[0], subpath);
 			}.bind(this),
 			getClusterPath: this.__getClusterPath.bind(this, params.id)
@@ -101,14 +146,15 @@ Dashboard.routers.Apps = Marbles.Router.createClass({
 	appEnv: function (params) {
 		params = params[0];
 
-		Dashboard.secondaryView = React.renderComponent(
-			Dashboard.Views.AppEnv({
+		this.context.secondaryView = React.render(React.createElement(
+			AppEnvComponent,
+			{
 				appId: params.id,
 				onHide: function () {
-					Marbles.history.navigate(this.__getAppPath(params.id, params));
+					this.history.navigate(this.__getAppPath(params.id, params));
 				}.bind(this)
 			}),
-			Dashboard.secondaryEl
+			this.context.secondaryEl
 		);
 
 		// render app view in background
@@ -116,33 +162,88 @@ Dashboard.routers.Apps = Marbles.Router.createClass({
 	},
 
 	appLogs: function (params) {
+		this.context.primaryView = React.render(React.createElement(
+			AppLogsComponent,
+			this.__getAppLogsProps(params)),
+			this.context.el
+		);
+	},
+
+	__getAppLogsProps: function (params) {
+		params = params[0];
+		return {
+			taffyJobsStoreId: null,
+			appId: params.id,
+			lines: parseInt(params.lines || '') || 200,
+			onHide: function () {
+				this.history.navigate(this.__getAppPath(params.id, params));
+			}.bind(this)
+		};
+	},
+
+	appDelete: function (params) {
 		params = params[0];
 
-		Dashboard.secondaryView = React.renderComponent(
-			Dashboard.Views.AppLogs({
+		this.context.secondaryView = React.render(React.createElement(
+			AppDeleteComponent,
+			{
 				appId: params.id,
 				onHide: function () {
-					Marbles.history.navigate(this.__getAppPath(params.id, params));
+					this.history.navigate(this.__getAppPath(params.id, params));
 				}.bind(this)
 			}),
-			Dashboard.secondaryEl
+			this.context.secondaryEl
 		);
 
 		// render app view in background
 		this.app.apply(this, arguments);
 	},
 
-	appDelete: function (params) {
+	newAppResource: function (params) {
+		this.setState({
+			creatingResource: true
+		});
+
 		params = params[0];
 
-		Dashboard.secondaryView = React.renderComponent(
-			Dashboard.Views.AppDelete({
-				appId: params.id,
+		this.context.secondaryView = React.render(React.createElement(
+			AppResourceProvisioner,
+			{
+				key: Date.now(),
+				appID: params.id,
 				onHide: function () {
-					Marbles.history.navigate(this.__getAppPath(params.id, params));
+					this.history.navigate(this.__getAppPath(params.id, params));
 				}.bind(this)
 			}),
-			Dashboard.secondaryEl
+			this.context.secondaryEl
+		);
+
+		// render app view in background
+		this.app.apply(this, arguments);
+	},
+
+	appResourceDelete: function (params) {
+		params = params[0];
+
+		this.setState({
+			deletingResource: true,
+			appID: params.id,
+			providerID: params.providerID,
+			resourceID: params.resourceID
+		});
+
+		this.context.secondaryView = React.render(React.createElement(
+			ResourceDeleteComponent,
+			{
+				key: Date.now(),
+				appID: params.id,
+				providerID: params.providerID,
+				resourceID: params.resourceID,
+				onHide: function () {
+					this.history.navigate(this.__getAppPath(params.id, extend({}, params, {providerID: null, resourceID: null})));
+				}.bind(this)
+			}),
+			this.context.secondaryEl
 		);
 
 		// render app view in background
@@ -150,16 +251,22 @@ Dashboard.routers.Apps = Marbles.Router.createClass({
 	},
 
 	newAppRoute: function (params) {
+		this.setState({
+			creatingRoute: true
+		});
+
 		params = params[0];
 
-		Dashboard.secondaryView = React.renderComponent(
-			Dashboard.Views.NewAppRoute({
+		this.context.secondaryView = React.render(React.createElement(
+			NewAppRouteComponent,
+			{
+				key: Date.now(),
 				appId: params.id,
 				onHide: function () {
-					Marbles.history.navigate(this.__getAppPath(params.id, params));
+					this.history.navigate(this.__getAppPath(params.id, params));
 				}.bind(this)
 			}),
-			Dashboard.secondaryEl
+			this.context.secondaryEl
 		);
 
 		// render app view in background
@@ -167,19 +274,26 @@ Dashboard.routers.Apps = Marbles.Router.createClass({
 	},
 
 	appRouteDelete: function (params) {
+		this.setState({
+			deletingRoute: true
+		});
+
 		params = params[0];
 
-		Dashboard.secondaryView = React.renderComponent(
-			Dashboard.Views.AppRouteDelete({
+		this.context.secondaryView = React.render(React.createElement(
+			AppRouteDeleteComponent,
+			{
+				key: params.id + params.route,
 				appId: params.id,
 				routeId: params.route,
+				routeType: params.type,
 				domain: params.domain,
 				onHide: function () {
-					var path = this.__getAppPath(params.id, Marbles.QueryParams.replaceParams([Marbles.Utils.extend({}, params)], {route: null, domain:null})[0]);
-					Marbles.history.navigate(path);
+					var path = this.__getAppPath(params.id, QueryParams.replaceParams([extend({}, params)], {route: null, domain: null, type: null})[0]);
+					this.history.navigate(path);
 				}.bind(this)
 			}),
-			Dashboard.secondaryEl
+			this.context.secondaryEl
 		);
 
 		// render app view in background
@@ -189,19 +303,48 @@ Dashboard.routers.Apps = Marbles.Router.createClass({
 	appDeployCommit: function (params) {
 		params = params[0];
 
-		Dashboard.secondaryView = React.renderComponent(
-			Dashboard.Views.AppDeployCommit({
+		this.context.secondaryView = React.render(React.createElement(
+			AppDeployCommitComponent,
+			{
 				appId: params.id,
 				ownerLogin: params.owner,
 				repoName: params.repo,
 				branchName: params.branch,
 				sha: params.sha,
 				onHide: function () {
-					var path = this.__getAppPath(params.id, Marbles.QueryParams.replaceParams([Marbles.Utils.extend({}, params)], {owner: null, repo: null, branch: null, sha: null})[0]);
-					Marbles.history.navigate(path);
+					var path = this.__getAppPath(params.id, QueryParams.replaceParams([extend({}, params)], {owner: null, repo: null, branch: null, sha: null})[0]);
+					this.history.navigate(path);
 				}.bind(this)
 			}),
-			Dashboard.secondaryEl
+			this.context.secondaryEl
+		);
+
+		// render app view in background
+		this.app.apply(this, arguments);
+	},
+
+	appDeployEvent: function (params) {
+		params = params[0];
+
+		var eventID = parseInt(params.event, 10);
+
+		this.setState({
+			deployingEvent: true,
+			eventID: eventID
+		});
+
+		this.context.secondaryView = React.render(React.createElement(
+			AppDeployEventComponent,
+			{
+				key: params.id + params.event,
+				appID: params.id,
+				eventID: eventID,
+				onHide: function () {
+					var path = this.__getAppPath(params.id, QueryParams.replaceParams([extend({}, params)], {event: null})[0]);
+					this.history.navigate(path);
+				}.bind(this)
+			}),
+			this.context.secondaryEl
 		);
 
 		// render app view in background
@@ -210,135 +353,190 @@ Dashboard.routers.Apps = Marbles.Router.createClass({
 
 	handleEvent: function (event) {
 		switch (event.name) {
-			case "APP:RELEASE_CREATED":
-				this.__handleReleaseCreated(event);
+		case 'handler:before':
+			// reset state between routes
+			this.state = {};
+			if (event.handler.opts.app === true) {
+				this.state.appID = event.params[0].id;
+			}
 			break;
 
-			case "APP:DELETED":
-				this.__handleAppDeleted(event);
+		case 'APP_DELETED':
+			if (this.state.appID === event.app) {
+				this.history.navigate("");
+			}
 			break;
 
-			case "APP_ROUTES:CREATED":
-				this.__handleAppRouteCreated(event);
+		case 'RESOURCE_DELETED':
+		case 'RESOURCE_APP_DELETED':
+			if (this.state.deletingResource && event.app === this.state.appID && event.object_id === this.state.resourceID) {
+				this.__navigateToApp(this.state.appID);
+			}
 			break;
 
-			case "APP_ROUTES:CREATE_FAILED":
-				this.__handleAppRouteCreateFailure(event);
+		case 'APP_PROVISION_RESOURCES':
+			if (this.state.creatingResource && event.appID === this.state.appID) {
+				this.setState({
+					providerIDs: event.providerIDs
+				});
+			}
 			break;
 
-			case "APP_ROUTES:DELETED":
-				this.__handleAppRouteDeleted(event);
+		case 'RESOURCE':
+			if (this.state.creatingResource && event.app === this.state.appID) {
+				this.setState({
+					providerIDs: (this.state.providerIDs || []).filter(function (providerID) {
+						return providerID !== event.data.provider;
+					})
+				});
+			}
 			break;
 
-			case "APP_ROUTES:DELETE_FAILED":
-				this.__handleAppRouteDeleteFailure(event);
+		case 'DEPLOYMENT':
+			if (this.state.creatingResource && event.app === this.state.appID) {
+				if (event.data.status === 'complete') {
+					this.__navigateToApp(this.state.appID);
+				} else if (event.data.status === 'failed') {
+					window.console.error('Failed to deploy app release.');
+				}
+			}
 			break;
 
-			case "GITHUB_BRANCH_SELECTOR:BRANCH_SELECTED":
-				this.__handleBranchSelected(event);
+		case 'CREATE_APP_ROUTE':
+			if (this.state.creatingRoute === true) {
+				this.setState({
+					routeDomain: event.data.domain
+				});
+			}
 			break;
 
-			case "GITHUB_COMMITS:COMMIT_SELECTED":
-				this.__handleCommitSelected(event);
+		case 'ROUTE':
+			if (this.state.creatingRoute === true && event.data.domain === this.state.routeDomain) {
+				this.__navigateToApp(event.app);
+			}
 			break;
 
-			case "APP_SOURCE_HISTORY:CONFIRM_DEPLOY_COMMIT":
-				this.__handleConfirmDeployCommit(event);
+		case 'DELETE_APP_ROUTE':
+			if (this.state.deletingRoute === true) {
+				this.setState({
+					routeID: event.routeID
+				});
+			}
 			break;
 
-			case "APP:JOB_CREATED":
-				this.__handleJobCreated(event);
+		case 'DELETE_APP_ROUTE_FAILED':
+			if (this.state.deletingRoute === true && event.routeID === this.state.routeID && event.status === 404) {
+				this.__navigateToApp(event.appID, {route: null, domain: null});
+			}
 			break;
 
-			case "APP:DEPLOY_FAILED":
-				this.__handleDeployFailure(event);
+		case 'ROUTE_DELETED':
+			if (this.state.deletingRoute === true && event.data.id === this.state.routeID) {
+				this.__navigateToApp(event.app, {route: null, domain: null});
+			}
 			break;
 
-			case "GITHUB_PULL:MERGED":
-				this.__handleGithubPullMerged(event);
+		case 'CONFIRM_DEPLOY_APP_EVENT':
+			if (this.state.appID === event.appID) {
+				this.history.navigate(this.__getAppPath(event.appID, {event: event.eventID}, '/deploy/:event'));
+			}
+			break;
+
+		case 'SCALE':
+			this.__handleScaleEvent(event);
+			break;
+
+		case 'DEPLOYMENT':
+			this.__handleDeploymentEvent(event);
+			break;
+
+		case "GITHUB_BRANCH_SELECTOR:BRANCH_SELECTED":
+			this.__handleBranchSelected(event);
+			break;
+
+		case "GITHUB_COMMITS:COMMIT_SELECTED":
+			this.__handleCommitSelected(event);
+			break;
+
+		case "APP_SOURCE_HISTORY:CONFIRM_DEPLOY_COMMIT":
+			this.__handleConfirmDeployCommit(event);
+			break;
+
+		case "GITHUB_PULL:MERGED":
+			this.__handleGithubPullMerged(event);
+			break;
+
+		case "GITHUB_AUTH_CHANGE":
+			if (this.context.waitingForNav) {
+				return;
+			}
+			this.history.navigate(this.history.path, { force: true, replace: true });
 			break;
 		}
 	},
 
-	__handleReleaseCreated: function (event) {
-		// exit app env view when successfully saved
-		var view = Dashboard.secondaryView;
-		if (view && view.isMounted() && view.constructor.displayName === "Views.AppEnv" && assertEqual(view.props.appId, event.appId) && view.state.isSaving) {
-			this.__navigateToApp(event);
+	__handleScaleEvent: function (event) {
+		if (this.state.deployingEvent !== true || event.app !== this.state.appID) {
+			return;
+		}
+		var processes = DeployAppEventStore.getState({eventID: this.state.eventID}).processes;
+		if (assertEqual(processes, event.data.processes)) {
+			this.history.navigate(this.__getAppPath(this.state.appID));
 		}
 	},
 
-	__handleAppDeleted: function (event) {
-		// exit app delete view when successfully deleted
-		var view = Dashboard.secondaryView;
-		if (view && view.isMounted() && view.constructor.displayName === "Views.AppDelete" && assertEqual(view.props.appId, event.appId) && view.state.isDeleting) {
-			Marbles.history.navigate("");
+	__handleDeploymentEvent: function (event) {
+		var deployState = DeployAppEventStore.getState({eventID: this.state.eventID});
+		if (this.state.deployingEvent !== true || event.app !== this.state.appID) {
+			return;
 		}
-	},
-
-	__handleAppRouteCreated: function (event) {
-		// exit app rotue delete view when successfully deleted
-		var view = Dashboard.secondaryView;
-		if (view && view.isMounted() && view.constructor.displayName === "Views.NewAppRoute" && assertEqual(view.props.appId, event.appId) && view.state.isCreating) {
-			this.__navigateToApp(event);
-		}
-	},
-
-	__handleAppRouteCreateFailure: function (event) {
-		var view = Dashboard.secondaryView;
-		if (view && view.isMounted() && view.constructor.displayName === "Views.AppRouteDelete" && assertEqual(view.props.appId, event.appId) && view.state.isDeleting) {
-			view.setProps({
-				errorMsg: event.errorMsg
-			});
-		}
-	},
-
-	__handleAppRouteDeleted: function (event) {
-		// exit app rotue delete view when successfully deleted
-		var view = Dashboard.secondaryView;
-		if (view && view.isMounted() && view.constructor.displayName === "Views.AppRouteDelete" && assertEqual(view.props.appId, event.appId) && view.props.routeId === event.routeId && view.state.isDeleting) {
-			this.__navigateToApp(event, {route: null, domain: null});
-		}
-	},
-
-	__handleAppRouteDeleteFailure: function (event) {
-		var view = Dashboard.secondaryView;
-		if (view && view.isMounted() && view.constructor.displayName === "Views.AppRouteDelete" && assertEqual(view.props.appId, event.appId) && view.props.routeId === event.routeId && view.state.isDeleting) {
-			view.setProps({
-				errorMsg: event.errorMsg
-			});
+		if (deployState.event && deployState.event.app === event.app && deployState.event.object_id === event.object_id && event.status !== 'failed') {
+			this.history.navigate(this.__getAppPath(this.state.appID));
 		}
 	},
 
 	__handleCommitSelected: function (event) {
-		var view = Dashboard.primaryView;
+		var view = this.context.primaryView, appView;
+		if (view.refs && view.refs.appComponent) {
+			appView = view.refs.appComponent;
+		} else {
+			return;
+		}
 		var storeId = event.storeId;
-		var app = view.state ? view.state.app : null;
-		var meta = app ? app.meta : null;
-		if (storeId && meta && view && view.isMounted() && view.constructor.displayName === "Views.App" && storeId && meta.user_login === storeId.ownerLogin && meta.repo_name === storeId.repoName) {
+		var release = appView.state ? appView.state.release : null;
+		var meta = release ? release.meta : null;
+		if (storeId && meta && view && view.isMounted() && view.constructor.displayName === "Views.Apps" && meta.github_user === storeId.ownerLogin && meta.github_repo === storeId.repoName) {
 			view.setProps({
-				selectedSha: event.sha
+				appProps: extend({}, view.props.appProps, {
+					selectedSha: event.sha
+				})
 			});
 		}
 	},
 
 	__handleBranchSelected: function (event) {
-		var view = Dashboard.primaryView;
+		var view = this.context.primaryView, appView;
+		if (view && view.refs && view.refs.appComponent) {
+			appView = view.refs.appComponent;
+		} else {
+			return;
+		}
 		var storeId = event.storeId;
-		var app = view.state ? view.state.app : null;
-		var meta = app ? app.meta : null;
-		if (storeId && meta && view && view.isMounted() && view.constructor.displayName === "Views.App" && storeId && meta.user_login === storeId.ownerLogin && meta.repo_name === storeId.repoName) {
+		var release = appView.state ? appView.state.release : null;
+		var meta = release ? release.meta : null;
+		if (storeId && meta && view && view.isMounted() && view.constructor.displayName === "Views.Apps" && meta.github_user === storeId.ownerLogin && meta.github_repo === storeId.repoName) {
 			view.setProps({
-				selectedBranchName: event.branchName
+				appProps: extend({}, view.props.appProps, {
+					selectedBranchName: event.branchName
+				})
 			});
 		}
 	},
 
 	__handleConfirmDeployCommit: function (event) {
-		var view = Dashboard.primaryView;
-		var appId = event.storeId ? event.storeId.appId : null;
-		if (view && view.isMounted() && view.constructor.displayName === "Views.App" && view.props.appId === appId) {
-			Marbles.history.navigate(this.__getAppPath(appId, {
+		var appID = event.storeId ? event.storeId.appId : null;
+		if (this.state.appID === appID) {
+			this.history.navigate(this.__getAppPath(appID, {
 				owner: event.ownerLogin,
 				repo: event.repoName,
 				branch: event.branchName,
@@ -347,29 +545,11 @@ Dashboard.routers.Apps = Marbles.Router.createClass({
 		}
 	},
 
-	__handleJobCreated: function (event) {
-		var view = Dashboard.secondaryView;
-		if (view && view.isMounted() && view.constructor.displayName === "Views.AppDeployCommit" && assertEqual(view.props.appId, event.appId)) {
-			view.setProps({
-				job: event.job
-			});
-		}
-	},
-
-	__handleDeployFailure: function (event) {
-		var view = Dashboard.secondaryView;
-		if (view && view.isMounted() && view.constructor.displayName === "Views.AppDeployCommit" && assertEqual(view.props.appId, event.appId)) {
-			view.setProps({
-				errorMsg: event.errorMsg
-			});
-		}
-	},
-
 	__handleGithubPullMerged: function (event) {
-		var view = Dashboard.primaryView;
+		var view = this.context.primaryView;
 		var base = event.pull.base;
-		if (view && view.isMounted() && view.constructor.displayName === "Views.App") {
-			Marbles.history.navigate(this.__getAppPath(view.props.appId, {
+		if (view && view.isMounted() && view.constructor.displayName === "Views.Apps" && view.props.appProps.appId) {
+			this.history.navigate(this.__getAppPath(view.props.appProps.appId, {
 				owner: base.ownerLogin,
 				repo: base.name,
 				branch: base.ref,
@@ -379,20 +559,20 @@ Dashboard.routers.Apps = Marbles.Router.createClass({
 	},
 
 	__getAppPath: function (appId, __params, subPath) {
-		var params = Marbles.QueryParams.deserializeParams(Marbles.history.path.split("?")[1] || "");
-		params = Marbles.QueryParams.replaceParams(params, Marbles.Utils.extend({id: appId}, __params));
+		var params = QueryParams.deserializeParams(this.history.path.split("?")[1] || "");
+		params = QueryParams.replaceParams(params, extend({id: appId}, __params));
 		subPath = subPath || "";
-		return Marbles.history.pathWithParams("/apps/:id" + subPath, params);
+		return pathWithParams("/apps/:id" + subPath, params);
 	},
 
 	__getClusterPath: function () {
-		return "/";
+		return "/apps";
 	},
 
-	__navigateToApp: function (event, __params) {
-		Marbles.history.navigate(this.__getAppPath(event.appId, __params));
+	__navigateToApp: function (appID, __params) {
+		this.history.navigate(this.__getAppPath(appID, __params));
 	}
 
 });
 
-})();
+export default AppsRouter;

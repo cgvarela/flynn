@@ -1,80 +1,75 @@
-/** @jsx React.DOM */
-
-(function () {
-
-"use strict";
-
-Dashboard.Views.EditEnv = React.createClass({
+var EditEnv = React.createClass({
 	displayName: "Views.EditEnv",
 
 	render: function () {
+		var nRemoved = this.state.nRemoved;
+		var newEnv = [{ isNew: true }];
+		if (this.props.disabled) {
+			newEnv = [];
+		}
 		return (
-			<ul className="edit-env">
-				{this.state.env.map(function (env, i) {
+			<ul className="edit-env" style={this.props.style}>
+				{this.state.env.concat(newEnv).map(function (env, i) {
 					return (
-						<li key={i}>
+						<li key={nRemoved + i}>
 							<AppEnv
-								index={i}
+								index={env.isNew ? null : i}
 								name={env.key}
 								value={env.value}
-								onChange={this.handleEnvChange} />
+								disabled={this.props.disabled}
+								onChange={this.handleEnvChange}
+								onSubmit={this.handleSubmit} />
 						</li>
 					);
 				}.bind(this))}
-				<li>
-					<AppEnv
-						key={'new-env'}
-						ref="newEnv"
-						index={null}
-						name={null}
-						value={null}
-						onChange={this.handleEnvChange} />
-				</li>
 			</ul>
 		);
 	},
 
 	getInitialState: function () {
 		return {
-			env: []
+			env: [],
+			nRemoved: 0
 		};
 	},
 
 	componentWillMount: function () {
-		this.__setEnv(this.props.env || {});
+		this.__setEnv(this.props);
 	},
 
 	componentWillReceiveProps: function (props) {
-		this.__setEnv(props.env || {});
+		this.__setEnv(props);
 	},
 
-	componentDidUpdate: function () {
-		if (this.__focusNewEnv) {
-			delete this.__focusNewEnv;
-			this.refs.newEnv.focusNameField();
-		}
-	},
-
-	__setEnv: function (env) {
-		var __env = [];
+	__setEnv: function (props) {
+		var env = props.env || {};
+		var nextEnv = [];
+		var prevState = this.state;
 		for (var k in env) {
 			if (env.hasOwnProperty(k)) {
-				__env.push({
+				nextEnv.push({
 					key: k,
 					value: env[k]
 				});
 			}
 		}
-		this.setState({env: __env});
+		if (props.disabled || prevState.env.length === 0) {
+			nextEnv.sort(function (a, b) {
+				return a.key.localeCompare(b.key);
+			});
+		}
+		this.setState({
+			env: nextEnv
+		});
 	},
 
-	handleEnvChange: function (index, oldName, newName, newValue) {
+	__envForChange: function (index, oldName, newName, newValue) {
 		var env = [].concat(this.state.env);
+		var nRemoved = this.state.nRemoved;
 
 		if (index === null) {
 			index = env.length;
 			env.push({});
-			this.__focusNewEnv = true;
 		}
 
 		if ( !newName ) {
@@ -90,6 +85,7 @@ Dashboard.Views.EditEnv = React.createClass({
 				var __env = [];
 				for (var i = 0, len = env.length; i < len; i++) {
 					if (i !== index && env[i].key === newName) {
+						nRemoved++;
 					} else {
 						__env.push(env[i]);
 					}
@@ -98,16 +94,30 @@ Dashboard.Views.EditEnv = React.createClass({
 			}
 		}
 
-		__env = {};
+		return [env, nRemoved];
+	},
+
+	handleEnvChange: function (index, oldName, newName, newValue) {
+		var tmp = this.__envForChange(index, oldName, newName, newValue);
+		var env = tmp[0], nRemoved = tmp[1];
+
+		var __env = {};
 		env.forEach(function (i) {
 			__env[i.key] = i.value;
 		});
-		env = __env;
 
-		this.__setEnv(env);
-		this.props.onChange(env);
+		this.setState({ env: env, nRemoved: nRemoved });
+		this.props.onChange(__env);
+	},
+
+	handleSubmit: function () {
+		if (this.props.hasOwnProperty('onSubmit')) {
+			this.props.onSubmit();
+		}
 	}
 });
+
+var KEY_CODE_RETURN = 13;
 
 var AppEnv = React.createClass({
 	displayName: "Views.EditEnv AppEnv",
@@ -121,6 +131,7 @@ var AppEnv = React.createClass({
 					ref='name'
 					value={this.state.name}
 					placeholder="ENV key"
+					onKeyPress={this.handleKeyPress}
 					onChange={this.handleNameChange}
 					onBlur={this.handleNameBlur} />:
 
@@ -129,6 +140,7 @@ var AppEnv = React.createClass({
 						ref='value'
 						value={this.state.value}
 						placeholder="ENV value"
+						onKeyPress={this.handleKeyPress}
 						onChange={this.handleValueChange}
 						onBlur={this.handleValueBlur} />
 			</div>
@@ -154,30 +166,51 @@ var AppEnv = React.createClass({
 	},
 
 	handleNameChange: function () {
+		if (this.props.disabled) {
+			return null;
+		}
 		var newName = this.refs.name.getDOMNode().value;
 		this.setState({name: newName});
+		this.propagateChange(newName, this.state.value || "");
+	},
+
+	handleKeyPress: function (e) {
+		if ((e.ctrlKey || e.metaKey) && e.charCode === KEY_CODE_RETURN) {
+			e.preventDefault();
+			this.props.onSubmit();
+		}
 	},
 
 	handleValueChange: function () {
+		if (this.props.disabled) {
+			return null;
+		}
 		var newValue = this.refs.value.getDOMNode().value;
 		this.setState({value: newValue});
+		if (this.state.name) {
+			this.propagateChange(this.state.name, newValue);
+		}
 	},
 
 	handleNameBlur: function () {
-		this.propagateChange();
+		if (this.props.disabled) {
+			return null;
+		}
+		this.propagateChange(this.state.name, this.state.value);
 	},
 
 	handleValueBlur: function () {
-		this.propagateChange();
+		if (this.props.disabled) {
+			return null;
+		}
+		this.propagateChange(this.state.name, this.state.value);
 	},
 
-	propagateChange: function () {
+	propagateChange: function (newName, newValue) {
 		var oldName = this.props.name;
-		var newName = this.state.name.trim();
 		var oldValue = this.props.value;
-		var newValue = this.state.value.trim();
 
-		if ( !oldName && (!newName || !newValue) ) {
+		if ( !oldName && !newName) {
 			return;
 		}
 
@@ -191,4 +224,4 @@ var AppEnv = React.createClass({
 	}
 });
 
-})();
+export default EditEnv;

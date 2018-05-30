@@ -4,111 +4,157 @@ set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 source "${ROOT}/script/lib/ui.sh"
+source "${ROOT}/script/lib/util.sh"
 
 usage() {
   cat <<USAGE >&2
 usage: $0 [options]
 
+Boot a Flynn cluster.
+
+Use the --size flag to boot a multi-node cluster, which will create a virtual
+network interface for each node and bind all host network services to that
+interface (i.e. flynn-host, discoverd, flannel and router)
+
 OPTIONS:
-  -h            Show this message
-  -b BACKEND    The job backend to use (either docker or libvirt-lxc) [default: libvirt-lxc]
-  -i IP         The external IP address to bind to [default: the IP assigned to eth0]
+  -h, --help               Show this message
+  -s, --size=SIZE          Cluster size [default: 1]
+  -z, --no-destroy-vols    Don't destroy volumes
+  -v, --version=VERSION    Boot using the released VERSION (e.g. v20151104.1)
+  --from-backup=FILE       Bootstrap from backup file or URL (e.g. https://s3.amazonaws.com/flynn-test/backups/nodejs-v20160624.1.tar)
+  --steps=STEPS            Only run the given steps (comma separated)
 USAGE
 }
 
 main() {
-  local backend ip
+  local size="1"
+  local version=""
+  local host_flags=()
+  local backup=""
+  local backup_url=""
+  local steps=""
 
-  while getopts "hb:i:" opt; do
-    case $opt in
-      h)
-	usage
-	exit 1
-	;;
-      b)
-	backend=$OPTARG
-	;;
-      i)
-	ip=$OPTARG
-	;;
-      ?)
-	usage
-	exit 1
-	;;
+  while true; do
+    case "$1" in
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      -s | --size)
+        if [[ -z "$2" ]]; then
+          usage
+          exit 1
+        fi
+        size="$2"
+        shift 2
+        ;;
+      -z | --no-destroy-vols)
+        host_flags+=("--no-destroy-vols")
+        shift
+        ;;
+      -v | --version)
+        if [[ -z "$2" ]]; then
+          usage
+          exit 1
+        fi
+        version="$2"
+        shift 2
+        ;;
+      --from-backup)
+        if [[ -z "$2" ]]; then
+          usage
+          exit 1
+        fi
+        if [[ "${2:0:8}" = "https://" ]]; then
+          backup_url="$2"
+        else
+          backup="$2"
+        fi
+        shift 2
+        ;;
+      --steps)
+        if [[ -z "$2" ]]; then
+          fail "--steps flag requires an argument"
+        fi
+        steps="$2"
+        shift 2
+        ;;
+      *)
+        break
+        ;;
     esac
   done
 
-  backend=${backend:-"libvirt-lxc"}
-  ip=${ip:-$(/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}')}
+  if [[ $# -ne 0 ]]; then
+    usage
+    exit 1
+  fi
 
-  export DISCOVERD="${ip}:1111"
-  export CONTROLLER_DOMAIN="dev.localflynn.com"
-  export DEFAULT_ROUTE_DOMAIN="${CONTROLLER_DOMAIN}"
+  local bin_dir="${ROOT}/build/bin"
+  local flynn_host="${bin_dir}/flynn-host"
+  local manifest="${ROOT}/build/manifests/bootstrap-manifest.json"
+
+  if [[ -n "${backup_url}" ]]; then
+    info "using backup URL ${backup_url}"
+    backup="${ROOT}/tmp/backups/$(basename "${backup_url}")"
+    if [[ ! -s "${backup}" ]]; then
+      mkdir -p "${ROOT}/tmp/backups"
+      curl --fail --location --output "${backup}" "${backup_url}"
+    fi
+  fi
+
+  if [[ -n "${version}" ]]; then
+    local dir="${ROOT}/tmp/${version}"
+    mkdir -p "${dir}"
+
+    info "downloading ${version} into ${dir}"
+    local args=(
+      --config-dir "${dir}"
+      --bin-dir    "${dir}"
+    )
+    if [[ "${version:1:8}" -ge "20161106" ]]; then
+      args+=(
+        --volpath "/var/lib/flynn/volumes-0"
+      )
+    fi
+    sudo FLYNN_VERSION="${version}" "${flynn_host}" download ${args[@]}
+    flynn_host="${dir}/flynn-host"
+    bin_dir="${dir}"
+    manifest="${dir}/bootstrap-manifest.json"
+    host_flags+=("--bin-dir" "${bin_dir}")
+  fi
 
   # kill flynn first
-  "${ROOT}/script/kill-flynn" -b "${backend}"
+  "${ROOT}/script/kill-flynn"
 
-  case "${backend}" in
-    libvirt-lxc)
-      boot_libvirt_lxc $ip
-      ;;
-    docker)
-      boot_docker $ip
-      ;;
-    *)
-      usage
-      exit 1
-      ;;
-  esac
-}
+  # populate IP list for bootstrap
+  local ips=()
+  info "starting ${size} node cluster"
 
-boot_libvirt_lxc() {
-  local ip=$1
-  local host_dir="${ROOT}/host"
-  local bootstrap_dir="${ROOT}/bootstrap"
+  # don't create unnecessary vxlan devices
+  export FLANNEL_BACKEND="alloc"
 
-  local log="/tmp/flynn-host-$(date +%Y-%m-%dT%H-%M-%S.%N).log"
-  ln -nfs "${log}" /tmp/flynn-host.log
-  info "starting flynn-host (libvirt-lxc backend)"
-  info "forwarding daemon output to ${log}"
-  sudo start-stop-daemon \
-    --start \
-    --background \
-    --no-close \
-    --exec "${host_dir}/bin/flynn-host" \
-    -- \
-    daemon \
-    --manifest "${host_dir}/bin/manifest.json" \
-    --external $ip \
-    --force \
-    --backend libvirt-lxc \
-    --state /tmp/flynn-host-state.json \
-    --flynn-init "${host_dir}/bin/flynn-init" \
-    &>"${log}"
+  for index in $(seq 0 $((size - 1))); do
+    # An RFC 5737 TEST-NET IP
+    local ip="192.0.2.20$(($index))"
+    ips+=("${ip}")
+    "${ROOT}/script/start-flynn-host" ${host_flags[@]} "${index}"
+  done
 
   info "bootstrapping Flynn"
-  "${bootstrap_dir}/bin/flynn-bootstrap" "${bootstrap_dir}/bin/manifest.json"
-}
-
-boot_docker() {
-  local ip=$1
-
-  info "starting flynn-host (docker backend)"
-  docker run \
-    --detach \
-    --volume /var/run/docker.sock:/var/run/docker.sock \
-    --publish 1113:1113 \
-    flynn/host \
-    --external $ip \
-    --force \
-    --backend docker
-
-  info "bootstrapping Flynn"
-  docker run \
-    --env DISCOVERD="${DISCOVERD}" \
-    --env CONTROLLER_DOMAIN="${CONTROLLER_DOMAIN}" \
-    --env DEFAULT_ROUTE_DOMAIN="${DEFAULT_ROUTE_DOMAIN}" \
-    flynn/bootstrap
+  export CLUSTER_DOMAIN="${CLUSTER_DOMAIN:-"${size}.localflynn.com"}"
+  export DISCOVERD="$(join "," ${ips[@]/%/:1111})"
+  local flags=(
+    "--min-hosts=${size}"
+    "--peer-ips=$(join "," ${ips[@]})"
+  )
+  if [[ -n "${backup}" ]]; then
+    flags+=("--from-backup=${backup}")
+  fi
+  if [[ -n "${steps}" ]]; then
+    flags+=("--steps=${steps}")
+  fi
+  "${flynn_host}" bootstrap ${flags[@]} "${manifest}"
 }
 
 main $@

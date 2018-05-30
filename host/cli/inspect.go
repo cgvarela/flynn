@@ -4,26 +4,35 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 	"text/tabwriter"
+	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
 	"github.com/flynn/flynn/host/types"
 	"github.com/flynn/flynn/pkg/cluster"
+	"github.com/flynn/go-docopt"
 )
 
 func init() {
 	Register("inspect", runInspect, `
-usage: flynn-host inspect ID
+usage: flynn-host inspect [options] ID
 
-Get low-level information about a job.`)
+Get low-level information about a job.
+
+options:
+  --omit-env         don't include the job environment, which may be sensitive
+  --redact-env ENVS  don't print the specified comma-separated env values
+`)
 }
 
 func runInspect(args *docopt.Args, client *cluster.Client) error {
-	hostID, jobID, err := cluster.ParseJobID(args.String["ID"])
+	jobID := args.String["ID"]
+	hostID, err := cluster.ExtractHostID(jobID)
 	if err != nil {
 		return err
 	}
-	hostClient, err := client.DialHost(hostID)
+	hostClient, err := client.Host(hostID)
 	if err != nil {
 		return fmt.Errorf("could not connect to host %s: %s", hostID, err)
 	}
@@ -32,24 +41,63 @@ func runInspect(args *docopt.Args, client *cluster.Client) error {
 		return fmt.Errorf("no such job")
 	}
 
-	printJobDesc(job, os.Stdout)
+	printJobDesc(job, os.Stdout, !args.Bool["--omit-env"], strings.Split(args.String["--redact-env"], ","))
 	return nil
 }
 
-func printJobDesc(job *host.ActiveJob, out io.Writer) {
+func displayTime(ts time.Time) string {
+	if ts.IsZero() {
+		return ""
+	}
+	return ts.String()
+}
+
+func printJobDesc(job *host.ActiveJob, out io.Writer, env bool, redactEnv []string) {
 	w := tabwriter.NewWriter(out, 1, 2, 2, ' ', 0)
 	defer w.Flush()
-	listRec(w, "ID", clusterJobID(*job))
+
+	var exitStatus string
+	if job.ExitStatus != nil {
+		exitStatus = strconv.Itoa(*job.ExitStatus)
+	}
+	var pid string
+	if job.PID != nil {
+		pid = strconv.Itoa(*job.PID)
+	}
+	var jobError string
+	if job.Error != nil {
+		jobError = *job.Error
+	}
+
+	listRec(w, "ID", job.Job.ID)
+	listRec(w, "Args", strings.Join(job.Job.Config.Args, " "))
 	listRec(w, "Status", job.Status)
+	listRec(w, "CreatedAt", job.CreatedAt)
 	listRec(w, "StartedAt", job.StartedAt)
-	listRec(w, "EndedAt", job.EndedAt)
-	listRec(w, "ExitStatus", job.ExitStatus)
+	listRec(w, "EndedAt", displayTime(job.EndedAt))
+	listRec(w, "PID", pid)
+	listRec(w, "ExitStatus", exitStatus)
+	listRec(w, "Error", jobError)
 	listRec(w, "IP Address", job.InternalIP)
+	for i, m := range job.Job.Mountspecs {
+		listRec(w, fmt.Sprintf("Mountspec[%d]", i), m)
+	}
+	for _, vb := range job.Job.Config.Volumes {
+		listRec(w, fmt.Sprintf("Volume[%s]", vb.Target), vb.VolumeID)
+	}
 	for k, v := range job.Job.Metadata {
 		listRec(w, k, v)
 	}
-	for k, v := range job.Job.Config.Env {
-		listRec(w, fmt.Sprintf("ENV[%s]", k), v)
+	if env {
+		for k, v := range job.Job.Config.Env {
+			for _, s := range redactEnv {
+				if s == k {
+					v = "XXXREDACTEDXXX"
+					break
+				}
+			}
+			listRec(w, fmt.Sprintf("ENV[%s]", k), v)
+		}
 	}
 }
 

@@ -45,11 +45,13 @@ func (a *AddAppAction) Run(s *State) error {
 		return err
 	}
 	as.App = a.App
-	if err := client.CreateArtifact(data.Artifact); err != nil {
-		return err
+	for _, artifact := range data.Artifacts {
+		if err := client.CreateArtifact(artifact); err != nil {
+			return err
+		}
 	}
-	as.Artifact = data.Artifact
-	if err := client.CreateRelease(data.Release); err != nil {
+	as.Artifacts = data.Artifacts
+	if err := client.CreateRelease(a.App.ID, data.Release); err != nil {
 		return err
 	}
 	as.Release = data.Release
@@ -66,6 +68,7 @@ func (a *AddAppAction) Run(s *State) error {
 
 		resource := &ct.Resource{
 			ID:         random.UUID(),
+			Apps:       []string{a.App.ID},
 			ProviderID: p.ID,
 			ExternalID: data.Resources[i].ID,
 			Env:        data.Resources[i].Env,
@@ -89,10 +92,5 @@ func (a *AddAppAction) Run(s *State) error {
 		return err
 	}
 
-	return nil
-}
-
-func (a *AddAppAction) Cleanup(s *State) error {
-	// TODO
 	return nil
 }

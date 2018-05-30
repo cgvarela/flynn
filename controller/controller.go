@@ -1,37 +1,49 @@
 package main
 
 import (
+	"crypto/md5"
 	"crypto/subtle"
-	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"strings"
-	"time"
+	"sync"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-sql"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/go-martini/martini"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/martini-contrib/binding"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/martini-contrib/render"
 	"github.com/flynn/flynn/controller/name"
+	"github.com/flynn/flynn/controller/schema"
 	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/flynn/controller/utils"
 	"github.com/flynn/flynn/discoverd/client"
+	logaggc "github.com/flynn/flynn/logaggregator/client"
+	logagg "github.com/flynn/flynn/logaggregator/types"
 	"github.com/flynn/flynn/pkg/cluster"
-	"github.com/flynn/flynn/pkg/cors"
+	"github.com/flynn/flynn/pkg/ctxhelper"
+	"github.com/flynn/flynn/pkg/httphelper"
 	"github.com/flynn/flynn/pkg/postgres"
-	"github.com/flynn/flynn/pkg/resource"
-	"github.com/flynn/flynn/pkg/rpcplus"
+	"github.com/flynn/flynn/pkg/shutdown"
+	"github.com/flynn/flynn/pkg/status"
 	routerc "github.com/flynn/flynn/router/client"
 	"github.com/flynn/flynn/router/types"
+	"github.com/flynn/que-go"
+	"github.com/julienschmidt/httprouter"
+	"golang.org/x/net/context"
+	"github.com/inconshreveable/log15"
 )
 
+var logger = log15.New("component", "controller")
+
 var ErrNotFound = errors.New("controller: resource not found")
+var ErrShutdown = errors.New("controller: shutting down")
+
+var schemaRoot = "/etc/flynn-controller/jsonschema"
 
 func main() {
+	defer shutdown.Exit()
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "3000"
@@ -46,373 +58,431 @@ func main() {
 		name.SetSeed(s)
 	}
 
-	db, err := postgres.Open("", "")
+	db := postgres.Wait(nil, nil)
+
+	if err := migrateDB(db); err != nil {
+		shutdown.Fatal(err)
+	}
+
+	// Reconnect, preparing statements now that schema is migrated
+	db.Close()
+	db = postgres.Wait(nil, schema.PrepareStatements)
+
+	shutdown.BeforeExit(func() { db.Close() })
+
+	lc, err := logaggc.New("")
 	if err != nil {
-		log.Fatal(err)
+		shutdown.Fatal(err)
 	}
+	rc := routerc.New()
 
-	if err := migrateDB(db.DB); err != nil {
-		log.Fatal(err)
-	}
+	doneCh := make(chan struct{})
+	shutdown.BeforeExit(func() { close(doneCh) })
+	go func() {
+		if err := streamRouterEvents(rc, db, doneCh); err != nil {
+			shutdown.Fatal(err)
+		}
+	}()
 
-	cc, err := cluster.NewClient()
+	// Listen for database migration, reset connpool on new migration
+	go postgres.ResetOnMigration(db, logger, doneCh)
+
+	hb, err := discoverd.DefaultClient.AddServiceAndRegisterInstance("controller", &discoverd.Instance{
+		Addr:  addr,
+		Proto: "http",
+		Meta: map[string]string{
+			"AUTH_KEY": os.Getenv("AUTH_KEY"),
+		},
+	})
 	if err != nil {
-		log.Fatal(err)
+		shutdown.Fatal(err)
 	}
 
-	sc, err := routerc.New()
-	if err != nil {
-		log.Fatal(err)
-	}
+	shutdown.BeforeExit(func() {
+		hb.Close()
+	})
 
-	if err := discoverd.Register("flynn-controller", addr); err != nil {
-		log.Fatal(err)
-	}
-
-	handler, _ := appHandler(handlerConfig{db: db, cc: cc, sc: sc, dc: discoverd.DefaultClient, key: os.Getenv("AUTH_KEY")})
-	log.Fatal(http.ListenAndServe(addr, handler))
+	handler := appHandler(handlerConfig{
+		db:     db,
+		cc:     utils.ClusterClientWrapper(cluster.NewClient()),
+		lc:     lc,
+		rc:     rc,
+		keys:   strings.Split(os.Getenv("AUTH_KEY"), ","),
+		keyIDs: strings.Split(os.Getenv("AUTH_KEY_IDS"), ","),
+		caCert: []byte(os.Getenv("CA_CERT")),
+	})
+	shutdown.Fatal(http.ListenAndServe(addr, handler))
 }
 
-type dbWrapper interface {
-	Database() *sql.DB
-	DSN() string
-	Close() error
+func streamRouterEvents(rc routerc.Client, db *postgres.DB, doneCh chan struct{}) error {
+	// wait for router to come up
+	{
+		events := make(chan *discoverd.Event)
+		stream, err := discoverd.NewService("router-api").Watch(events)
+		if err != nil {
+			return err
+		}
+		for e := range events {
+			if e.Kind == discoverd.EventKindUp {
+				break
+			}
+		}
+		stream.Close()
+	}
+
+	events := make(chan *router.StreamEvent)
+	s, err := rc.StreamEvents(nil, events)
+	if err != nil {
+		return err
+	}
+	go func() {
+		for {
+			e, ok := <-events
+			if !ok {
+				return
+			}
+			route := e.Route
+			var appID string
+			if strings.HasPrefix(route.ParentRef, ct.RouteParentRefPrefix) {
+				appID = strings.TrimPrefix(route.ParentRef, ct.RouteParentRefPrefix)
+			}
+			eventType := ct.EventTypeRoute
+			if e.Event == "remove" {
+				eventType = ct.EventTypeRouteDeletion
+			}
+			hash := md5.New()
+			io.WriteString(hash, appID)
+			io.WriteString(hash, string(eventType))
+			io.WriteString(hash, route.ID)
+			io.WriteString(hash, route.CreatedAt.String())
+			io.WriteString(hash, route.UpdatedAt.String())
+			uniqueID := fmt.Sprintf("%x", hash.Sum(nil))
+			if err := createEvent(db.Exec, &ct.Event{
+				AppID:      appID,
+				ObjectID:   route.ID,
+				ObjectType: eventType,
+				UniqueID:   uniqueID,
+			}, route); err != nil {
+				log.Println(err)
+			}
+		}
+	}()
+	_, _ = <-doneCh
+	return s.Close()
+}
+
+type logClient interface {
+	GetLog(channelID string, options *logagg.LogOpts) (io.ReadCloser, error)
 }
 
 type handlerConfig struct {
-	db  dbWrapper
-	cc  clusterClient
-	sc  routerc.Client
-	dc  *discoverd.Client
-	key string
+	db     *postgres.DB
+	cc     utils.ClusterClient
+	lc     logClient
+	rc     routerc.Client
+	keys   []string
+	keyIDs []string
+	caCert []byte
 }
 
-type ResponseHelper interface {
-	Error(error)
-	JSON(int, interface{})
-	WriteHeader(int)
-}
-
-type responseHelper struct {
-	http.ResponseWriter
-	render.Render
-}
-
-func (r *responseHelper) Error(err error) {
-	switch err.(type) {
+// NOTE: this is temporary until httphelper supports custom errors
+func respondWithError(w http.ResponseWriter, err error) {
+	switch v := err.(type) {
 	case ct.ValidationError:
-		r.JSON(400, err)
-	case *json.SyntaxError, *json.UnmarshalTypeError:
-		r.JSON(400, ct.ValidationError{Message: "The provided JSON input is invalid"})
+		httphelper.ValidationError(w, v.Field, v.Message)
 	default:
 		if err == ErrNotFound {
-			r.WriteHeader(404)
+			w.WriteHeader(404)
 			return
 		}
-		log.Println(err)
-		r.JSON(500, struct{}{})
+		httphelper.Error(w, err)
 	}
 }
 
-func responseHelperHandler(c martini.Context, w http.ResponseWriter, r render.Render) {
-	c.MapTo(&responseHelper{w, r}, (*ResponseHelper)(nil))
+func appHandler(c handlerConfig) http.Handler {
+	err := schema.Load(schemaRoot)
+	if err != nil {
+		shutdown.Fatal(err)
+	}
+
+	q := que.NewClient(c.db.ConnPool)
+	domainMigrationRepo := NewDomainMigrationRepo(c.db)
+	providerRepo := NewProviderRepo(c.db)
+	resourceRepo := NewResourceRepo(c.db)
+	appRepo := NewAppRepo(c.db, os.Getenv("DEFAULT_ROUTE_DOMAIN"), c.rc)
+	artifactRepo := NewArtifactRepo(c.db)
+	releaseRepo := NewReleaseRepo(c.db, artifactRepo, q)
+	jobRepo := NewJobRepo(c.db)
+	formationRepo := NewFormationRepo(c.db, appRepo, releaseRepo, artifactRepo)
+	releaseRepo.formations = formationRepo
+	deploymentRepo := NewDeploymentRepo(c.db)
+	eventRepo := NewEventRepo(c.db)
+	backupRepo := NewBackupRepo(c.db)
+	sinkRepo := NewSinkRepo(c.db)
+	volumeRepo := NewVolumeRepo(c.db)
+
+	api := controllerAPI{
+		domainMigrationRepo: domainMigrationRepo,
+		appRepo:             appRepo,
+		releaseRepo:         releaseRepo,
+		providerRepo:        providerRepo,
+		formationRepo:       formationRepo,
+		artifactRepo:        artifactRepo,
+		jobRepo:             jobRepo,
+		resourceRepo:        resourceRepo,
+		deploymentRepo:      deploymentRepo,
+		eventRepo:           eventRepo,
+		backupRepo:          backupRepo,
+		sinkRepo:            sinkRepo,
+		volumeRepo:          volumeRepo,
+		clusterClient:       c.cc,
+		logaggc:             c.lc,
+		routerc:             c.rc,
+		que:                 q,
+		caCert:              c.caCert,
+		config:              c,
+	}
+
+	shutdown.BeforeExit(api.Shutdown)
+
+	httpRouter := httprouter.New()
+
+	crud(httpRouter, "apps", ct.App{}, appRepo)
+	crud(httpRouter, "releases", ct.Release{}, releaseRepo)
+	crud(httpRouter, "providers", ct.Provider{}, providerRepo)
+	crud(httpRouter, "artifacts", ct.Artifact{}, artifactRepo)
+
+	httpRouter.Handler("GET", status.Path, status.Handler(func() status.Status {
+		if err := c.db.Exec("ping"); err != nil {
+			return status.Unhealthy
+		}
+		return status.Healthy
+	}))
+
+	httpRouter.GET("/ca-cert", httphelper.WrapHandler(api.GetCACert))
+
+	httpRouter.GET("/backup", httphelper.WrapHandler(api.GetBackup))
+
+	httpRouter.PUT("/domain", httphelper.WrapHandler(api.MigrateDomain))
+
+	httpRouter.POST("/apps/:apps_id", httphelper.WrapHandler(api.UpdateApp))
+	httpRouter.GET("/apps/:apps_id/log", httphelper.WrapHandler(api.appLookup(api.AppLog)))
+	httpRouter.DELETE("/apps/:apps_id", httphelper.WrapHandler(api.appLookup(api.DeleteApp)))
+	httpRouter.DELETE("/apps/:apps_id/releases/:releases_id", httphelper.WrapHandler(api.appLookup(api.DeleteRelease)))
+	httpRouter.POST("/apps/:apps_id/gc", httphelper.WrapHandler(api.appLookup(api.ScheduleAppGarbageCollection)))
+
+	httpRouter.PUT("/apps/:apps_id/formations/:releases_id", httphelper.WrapHandler(api.appLookup(api.PutFormation)))
+	httpRouter.GET("/apps/:apps_id/formations/:releases_id", httphelper.WrapHandler(api.appLookup(api.GetFormation)))
+	httpRouter.DELETE("/apps/:apps_id/formations/:releases_id", httphelper.WrapHandler(api.appLookup(api.DeleteFormation)))
+	httpRouter.GET("/apps/:apps_id/formations", httphelper.WrapHandler(api.appLookup(api.ListFormations)))
+	httpRouter.GET("/formations", httphelper.WrapHandler(api.GetFormations))
+
+	httpRouter.PUT("/apps/:apps_id/scale/:releases_id", httphelper.WrapHandler(api.appLookup(api.PutScaleRequest)))
+
+	httpRouter.POST("/apps/:apps_id/jobs", httphelper.WrapHandler(api.appLookup(api.RunJob)))
+	httpRouter.GET("/apps/:apps_id/jobs/:jobs_id", httphelper.WrapHandler(api.GetJob))
+	httpRouter.PUT("/apps/:apps_id/jobs/:jobs_id", httphelper.WrapHandler(api.PutJob))
+	httpRouter.GET("/apps/:apps_id/jobs", httphelper.WrapHandler(api.appLookup(api.ListJobs)))
+	httpRouter.DELETE("/apps/:apps_id/jobs/:jobs_id", httphelper.WrapHandler(api.KillJob))
+	httpRouter.GET("/active-jobs", httphelper.WrapHandler(api.ListActiveJobs))
+
+	httpRouter.POST("/apps/:apps_id/deploy", httphelper.WrapHandler(api.appLookup(api.CreateDeployment)))
+	httpRouter.GET("/apps/:apps_id/deployments", httphelper.WrapHandler(api.appLookup(api.ListDeployments)))
+	httpRouter.GET("/deployments/:deployment_id", httphelper.WrapHandler(api.GetDeployment))
+
+	httpRouter.PUT("/apps/:apps_id/release", httphelper.WrapHandler(api.appLookup(api.SetAppRelease)))
+	httpRouter.GET("/apps/:apps_id/release", httphelper.WrapHandler(api.appLookup(api.GetAppRelease)))
+	httpRouter.GET("/apps/:apps_id/releases", httphelper.WrapHandler(api.appLookup(api.GetAppReleases)))
+
+	httpRouter.GET("/resources", httphelper.WrapHandler(api.GetResources))
+	httpRouter.POST("/providers/:providers_id/resources", httphelper.WrapHandler(api.ProvisionResource))
+	httpRouter.GET("/providers/:providers_id/resources", httphelper.WrapHandler(api.GetProviderResources))
+	httpRouter.GET("/providers/:providers_id/resources/:resources_id", httphelper.WrapHandler(api.GetResource))
+	httpRouter.PUT("/providers/:providers_id/resources/:resources_id", httphelper.WrapHandler(api.PutResource))
+	httpRouter.DELETE("/providers/:providers_id/resources/:resources_id", httphelper.WrapHandler(api.DeleteResource))
+	httpRouter.PUT("/providers/:providers_id/resources/:resources_id/apps/:app_id", httphelper.WrapHandler(api.AddResourceApp))
+	httpRouter.DELETE("/providers/:providers_id/resources/:resources_id/apps/:app_id", httphelper.WrapHandler(api.DeleteResourceApp))
+	httpRouter.GET("/apps/:apps_id/resources", httphelper.WrapHandler(api.appLookup(api.GetAppResources)))
+
+	httpRouter.POST("/apps/:apps_id/routes", httphelper.WrapHandler(api.appLookup(api.CreateRoute)))
+	httpRouter.GET("/apps/:apps_id/routes", httphelper.WrapHandler(api.appLookup(api.GetRouteList)))
+	httpRouter.GET("/apps/:apps_id/routes/:routes_type/:routes_id", httphelper.WrapHandler(api.appLookup(api.GetRoute)))
+	httpRouter.PUT("/apps/:apps_id/routes/:routes_type/:routes_id", httphelper.WrapHandler(api.appLookup(api.UpdateRoute)))
+	httpRouter.DELETE("/apps/:apps_id/routes/:routes_type/:routes_id", httphelper.WrapHandler(api.appLookup(api.DeleteRoute)))
+
+	httpRouter.POST("/apps/:apps_id/meta", httphelper.WrapHandler(api.appLookup(api.UpdateApp)))
+
+	httpRouter.GET("/events", httphelper.WrapHandler(api.Events))
+	httpRouter.GET("/events/:id", httphelper.WrapHandler(api.GetEvent))
+
+	httpRouter.GET("/volumes", httphelper.WrapHandler(api.GetVolumes))
+	httpRouter.PUT("/volumes/:volume_id", httphelper.WrapHandler(api.PutVolume))
+	httpRouter.GET("/apps/:apps_id/volumes", httphelper.WrapHandler(api.appLookup(api.GetAppVolumes)))
+	httpRouter.GET("/apps/:apps_id/volumes/:volume_id", httphelper.WrapHandler(api.appLookup(api.GetVolume)))
+	httpRouter.PUT("/apps/:apps_id/volumes/:volume_id/decommission", httphelper.WrapHandler(api.appLookup(api.DecommissionVolume)))
+
+	httpRouter.POST("/sinks", httphelper.WrapHandler(api.CreateSink))
+	httpRouter.GET("/sinks", httphelper.WrapHandler(api.GetSinks))
+	httpRouter.GET("/sinks/:sink_id", httphelper.WrapHandler(api.GetSink))
+	httpRouter.DELETE("/sinks/:sink_id", httphelper.WrapHandler(api.DeleteSink))
+
+	if os.Getenv("AUDIT_LOG") == "true" {
+		return httphelper.ContextInjector("controller",
+			httphelper.NewRequestLoggerCustom(muxHandler(httpRouter, c.keyIDs, c.keys), auditLoggerFn))
+	}
+	return httphelper.ContextInjector("controller",
+		httphelper.NewRequestLogger(muxHandler(httpRouter, c.keyIDs, c.keys)))
 }
 
-func appHandler(c handlerConfig) (http.Handler, *martini.Martini) {
-	r := martini.NewRouter()
-	m := martini.New()
-	m.Map(log.New(os.Stdout, "[controller] ", log.LstdFlags|log.Lmicroseconds))
-	m.Use(martini.Logger())
-	m.Use(martini.Recovery())
-	m.Use(render.Renderer())
-	m.Use(responseHelperHandler)
-	m.Action(r.Handle)
+func muxHandler(main http.Handler, authIDs, authKeys []string) http.Handler {
+	return httphelper.CORSAllowAll.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if shutdown.IsActive() {
+			httphelper.ServiceUnavailableError(w, ErrShutdown.Error())
+			return
+		}
 
-	d := NewDB(c.db)
-
-	providerRepo := NewProviderRepo(d)
-	keyRepo := NewKeyRepo(d)
-	resourceRepo := NewResourceRepo(d)
-	appRepo := NewAppRepo(d, os.Getenv("DEFAULT_ROUTE_DOMAIN"), c.sc)
-	artifactRepo := NewArtifactRepo(d)
-	releaseRepo := NewReleaseRepo(d)
-	jobRepo := NewJobRepo(d)
-	formationRepo := NewFormationRepo(d, appRepo, releaseRepo, artifactRepo)
-	m.Map(resourceRepo)
-	m.Map(appRepo)
-	m.Map(artifactRepo)
-	m.Map(releaseRepo)
-	m.Map(jobRepo)
-	m.Map(formationRepo)
-	m.Map(c.dc)
-	m.MapTo(c.cc, (*clusterClient)(nil))
-	m.MapTo(c.sc, (*routerc.Client)(nil))
-	m.MapTo(c.dc, (*resource.DiscoverdClient)(nil))
-
-	getAppMiddleware := crud("apps", ct.App{}, appRepo, r)
-	getReleaseMiddleware := crud("releases", ct.Release{}, releaseRepo, r)
-	getProviderMiddleware := crud("providers", ct.Provider{}, providerRepo, r)
-	crud("artifacts", ct.Artifact{}, artifactRepo, r)
-	crud("keys", ct.Key{}, keyRepo, r)
-
-	r.Put("/apps/:apps_id/formations/:releases_id", getAppMiddleware, getReleaseMiddleware, binding.Bind(ct.Formation{}), putFormation)
-	r.Get("/apps/:apps_id/formations/:releases_id", getAppMiddleware, getFormationMiddleware, getFormation)
-	r.Delete("/apps/:apps_id/formations/:releases_id", getAppMiddleware, getFormationMiddleware, deleteFormation)
-	r.Get("/apps/:apps_id/formations", getAppMiddleware, listFormations)
-
-	r.Post("/apps/:apps_id/jobs", getAppMiddleware, binding.Bind(ct.NewJob{}), runJob)
-	r.Put("/apps/:apps_id/jobs/:jobs_id", getAppMiddleware, binding.Bind(ct.Job{}), putJob)
-	r.Get("/apps/:apps_id/jobs", getAppMiddleware, listJobs)
-	r.Delete("/apps/:apps_id/jobs/:jobs_id", getAppMiddleware, connectHostMiddleware, killJob)
-	r.Get("/apps/:apps_id/jobs/:jobs_id/log", getAppMiddleware, connectHostMiddleware, jobLog)
-
-	r.Put("/apps/:apps_id/release", getAppMiddleware, binding.Bind(releaseID{}), setAppRelease)
-	r.Get("/apps/:apps_id/release", getAppMiddleware, getAppRelease)
-
-	r.Post("/providers/:providers_id/resources", getProviderMiddleware, binding.Bind(ct.ResourceReq{}), resourceServerMiddleware, provisionResource)
-	r.Get("/providers/:providers_id/resources", getProviderMiddleware, getProviderResources)
-	r.Get("/providers/:providers_id/resources/:resources_id", getProviderMiddleware, getResourceMiddleware, getResource)
-	r.Put("/providers/:providers_id/resources/:resources_id", getProviderMiddleware, binding.Bind(ct.Resource{}), putResource)
-	r.Get("/apps/:apps_id/resources", getAppMiddleware, getAppResources)
-
-	r.Post("/apps/:apps_id/routes", getAppMiddleware, binding.Bind(router.Route{}), createRoute)
-	r.Get("/apps/:apps_id/routes", getAppMiddleware, getRouteList)
-	r.Get("/apps/:apps_id/routes/:routes_type/:routes_id", getAppMiddleware, getRouteMiddleware, getRoute)
-	r.Delete("/apps/:apps_id/routes/:routes_type/:routes_id", getAppMiddleware, getRouteMiddleware, deleteRoute)
-
-	return rpcMuxHandler(m, rpcHandler(formationRepo), c.key), m
-}
-
-func rpcMuxHandler(main http.Handler, rpch http.Handler, authKey string) http.Handler {
-	corsHandler := cors.Allow(&cors.Options{
-		AllowAllOrigins:  true,
-		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"},
-		AllowHeaders:     []string{"Authorization", "Accept", "Content-Type", "If-Match", "If-None-Match"},
-		ExposeHeaders:    []string{"ETag"},
-		AllowCredentials: true,
-		MaxAge:           time.Hour,
-	})
-
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		corsHandler(w, r)
-		if r.URL.Path == "/ping" || r.Method == "OPTIONS" {
+		if r.URL.Path == "/ping" {
 			w.WriteHeader(200)
 			return
 		}
-		_, password, _ := parseBasicAuth(r.Header)
-		if password == "" && strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+		_, password, _ := r.BasicAuth()
+		if password == "" && r.URL.Path == "/ca-cert" {
+			main.ServeHTTP(w, r)
+			return
+		}
+		if password == "" && (strings.Contains(r.Header.Get("Accept"), "text/event-stream") || r.URL.Path == "/backup") {
 			password = r.URL.Query().Get("key")
 		}
-		if len(password) != len(authKey) || subtle.ConstantTimeCompare([]byte(password), []byte(authKey)) != 1 {
+		var authed bool
+		for i, k := range authKeys {
+			if len(password) == len(k) && subtle.ConstantTimeCompare([]byte(password), []byte(k)) == 1 {
+				authed = true
+				if len(authIDs) == len(authKeys) {
+					r.Header.Set("Flynn-Auth-Key-ID", authIDs[i])
+				}
+				break
+			}
+		}
+		if !authed {
 			w.WriteHeader(401)
 			return
 		}
-		if r.URL.Path == rpcplus.DefaultRPCPath {
-			rpch.ServeHTTP(w, r)
-		} else {
-			main.ServeHTTP(w, r)
-		}
-	})
+		main.ServeHTTP(w, r)
+	}))
 }
 
-func putFormation(formation ct.Formation, app *ct.App, release *ct.Release, repo *FormationRepo, r ResponseHelper) {
-	formation.AppID = app.ID
-	formation.ReleaseID = release.ID
-	if app.Protected {
-		for typ := range release.Processes {
-			if formation.Processes[typ] == 0 {
-				r.Error(ct.ValidationError{Message: "unable to scale to zero, app is protected"})
-				return
-			}
-		}
-	}
-	if err := repo.Add(&formation); err != nil {
-		r.Error(err)
-		return
-	}
-	r.JSON(200, &formation)
+type controllerAPI struct {
+	domainMigrationRepo *DomainMigrationRepo
+	appRepo             *AppRepo
+	releaseRepo         *ReleaseRepo
+	providerRepo        *ProviderRepo
+	formationRepo       *FormationRepo
+	artifactRepo        *ArtifactRepo
+	jobRepo             *JobRepo
+	resourceRepo        *ResourceRepo
+	deploymentRepo      *DeploymentRepo
+	eventRepo           *EventRepo
+	backupRepo          *BackupRepo
+	sinkRepo            *SinkRepo
+	volumeRepo          *VolumeRepo
+	clusterClient       utils.ClusterClient
+	logaggc             logClient
+	routerc             routerc.Client
+	que                 *que.Client
+	caCert              []byte
+	config              handlerConfig
+
+	eventListener    *EventListener
+	eventListenerMtx sync.Mutex
 }
 
-func getFormationMiddleware(c martini.Context, app *ct.App, params martini.Params, repo *FormationRepo, r ResponseHelper) {
-	formation, err := repo.Get(app.ID, params["releases_id"])
+func (c *controllerAPI) getApp(ctx context.Context) *ct.App {
+	return ctx.Value("app").(*ct.App)
+}
+
+func (c *controllerAPI) getRelease(ctx context.Context) (*ct.Release, error) {
+	params, _ := ctxhelper.ParamsFromContext(ctx)
+	data, err := c.releaseRepo.Get(params.ByName("releases_id"))
 	if err != nil {
-		r.Error(err)
-		return
+		return nil, err
 	}
-	c.Map(formation)
+	return data.(*ct.Release), nil
 }
 
-func getFormation(formation *ct.Formation, r ResponseHelper) {
-	r.JSON(200, formation)
-}
-
-func deleteFormation(formation *ct.Formation, repo *FormationRepo, r ResponseHelper) {
-	err := repo.Remove(formation.AppID, formation.ReleaseID)
+func (c *controllerAPI) getProvider(ctx context.Context) (*ct.Provider, error) {
+	params, _ := ctxhelper.ParamsFromContext(ctx)
+	data, err := c.providerRepo.Get(params.ByName("providers_id"))
 	if err != nil {
-		r.Error(err)
-		return
+		return nil, err
 	}
-	r.WriteHeader(200)
+	return data.(*ct.Provider), nil
 }
 
-func listFormations(app *ct.App, repo *FormationRepo, r ResponseHelper) {
-	list, err := repo.List(app.ID)
-	if err != nil {
-		r.Error(err)
-		return
-	}
-	r.JSON(200, list)
-}
-
-type releaseID struct {
-	ID string `json:"id"`
-}
-
-func setAppRelease(app *ct.App, rid releaseID, apps *AppRepo, releases *ReleaseRepo, formations *FormationRepo, r ResponseHelper) {
-	rel, err := releases.Get(rid.ID)
-	if err != nil {
-		if err == ErrNotFound {
-			err = ct.ValidationError{
-				Message: fmt.Sprintf("could not find release with ID %s", rid.ID),
-			}
-		}
-		r.Error(err)
-		return
-	}
-	release := rel.(*ct.Release)
-	apps.SetRelease(app.ID, release.ID)
-
-	// TODO: use transaction/lock
-	fs, err := formations.List(app.ID)
-	if err != nil {
-		r.Error(err)
-		return
-	}
-	if len(fs) == 1 && fs[0].ReleaseID != release.ID {
-		if err := formations.Add(&ct.Formation{
-			AppID:     app.ID,
-			ReleaseID: release.ID,
-			Processes: fs[0].Processes,
-		}); err != nil {
-			r.Error(err)
+func (c *controllerAPI) appLookup(handler httphelper.HandlerFunc) httphelper.HandlerFunc {
+	return func(ctx context.Context, w http.ResponseWriter, req *http.Request) {
+		params, _ := ctxhelper.ParamsFromContext(ctx)
+		data, err := c.appRepo.Get(params.ByName("apps_id"))
+		if err != nil {
+			respondWithError(w, err)
 			return
 		}
-		if err := formations.Remove(app.ID, fs[0].ReleaseID); err != nil {
-			r.Error(err)
-			return
+		ctx = context.WithValue(ctx, "app", data.(*ct.App))
+		handler(ctx, w, req)
+	}
+}
+
+func routeParentRef(appID string) string {
+	return ct.RouteParentRefPrefix + appID
+}
+
+func (c *controllerAPI) getRoute(ctx context.Context) (*router.Route, error) {
+	params, _ := ctxhelper.ParamsFromContext(ctx)
+	route, err := c.routerc.GetRoute(params.ByName("routes_type"), params.ByName("routes_id"))
+	if err == routerc.ErrNotFound || err == nil && route.ParentRef != routeParentRef(c.getApp(ctx).ID) {
+		err = ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return route, err
+}
+
+func createEvent(dbExec func(string, ...interface{}) error, e *ct.Event, data interface{}) error {
+	args := []interface{}{e.ObjectID, string(e.ObjectType), data}
+	fields := []string{"object_id", "object_type", "data"}
+	if e.AppID != "" {
+		fields = append(fields, "app_id")
+		args = append(args, e.AppID)
+	}
+	if e.UniqueID != "" {
+		fields = append(fields, "unique_id")
+		args = append(args, e.UniqueID)
+	}
+	query := "INSERT INTO events ("
+	for i, n := range fields {
+		if i > 0 {
+			query += ","
 		}
+		query += n
 	}
-
-	r.JSON(200, release)
+	query += ") VALUES ("
+	for i := range fields {
+		if i > 0 {
+			query += ","
+		}
+		query += fmt.Sprintf("$%d", i+1)
+	}
+	query += ")"
+	return dbExec(query, args...)
 }
 
-func getAppRelease(app *ct.App, apps *AppRepo, r ResponseHelper) {
-	release, err := apps.GetRelease(app.ID)
-	if err != nil {
-		r.Error(err)
-		return
-	}
-	r.JSON(200, release)
+func (c *controllerAPI) GetCACert(_ context.Context, w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/x-x509-ca-cert")
+	w.Write(c.caCert)
 }
 
-func resourceServerMiddleware(c martini.Context, p *ct.Provider, dc resource.DiscoverdClient, r ResponseHelper) {
-	server, err := resource.NewServerWithDiscoverd(p.URL, dc)
-	if err != nil {
-		r.Error(err)
-		return
+func (c *controllerAPI) Shutdown() {
+	if c.eventListener != nil {
+		c.eventListener.CloseWithError(ErrShutdown)
 	}
-	c.Map(server)
-	c.Next()
-	server.Close()
-}
-
-func putResource(p *ct.Provider, params martini.Params, resource ct.Resource, repo *ResourceRepo, r ResponseHelper) {
-	resource.ID = params["resources_id"]
-	resource.ProviderID = p.ID
-	if err := repo.Add(&resource); err != nil {
-		r.Error(err)
-		return
-	}
-	r.JSON(200, &resource)
-}
-
-func provisionResource(rs *resource.Server, p *ct.Provider, req ct.ResourceReq, repo *ResourceRepo, r ResponseHelper) {
-	var config []byte
-	if req.Config != nil {
-		config = *req.Config
-	} else {
-		config = []byte(`{}`)
-	}
-	data, err := rs.Provision(config)
-	if err != nil {
-		r.Error(err)
-		return
-	}
-
-	res := &ct.Resource{
-		ProviderID: p.ID,
-		ExternalID: data.ID,
-		Env:        data.Env,
-		Apps:       req.Apps,
-	}
-	if err := repo.Add(res); err != nil {
-		// TODO: attempt to "rollback" provisioning
-		r.Error(err)
-		return
-	}
-	r.JSON(200, res)
-}
-
-func getResourceMiddleware(c martini.Context, params martini.Params, repo *ResourceRepo, r ResponseHelper) {
-	resource, err := repo.Get(params["resources_id"])
-	if err != nil {
-		r.Error(err)
-		return
-	}
-	c.Map(resource)
-}
-
-func getResource(resource *ct.Resource, r ResponseHelper) {
-	r.JSON(200, resource)
-}
-
-func getProviderResources(p *ct.Provider, repo *ResourceRepo, r ResponseHelper) {
-	res, err := repo.ProviderList(p.ID)
-	if err != nil {
-		r.Error(err)
-		return
-	}
-	r.JSON(200, res)
-}
-
-func getAppResources(app *ct.App, repo *ResourceRepo, r ResponseHelper) {
-	res, err := repo.AppList(app.ID)
-	if err != nil {
-		r.Error(err)
-		return
-	}
-	r.JSON(200, res)
-}
-
-func parseBasicAuth(h http.Header) (username, password string, err error) {
-	s := strings.SplitN(h.Get("Authorization"), " ", 2)
-
-	if len(s) != 2 {
-		return "", "", errors.New("failed to parse authentication string ")
-	}
-	if s[0] != "Basic" {
-		return "", "", fmt.Errorf("authorization scheme is %v, not Basic ", s[0])
-	}
-
-	c, err := base64.StdEncoding.DecodeString(s[1])
-	if err != nil {
-		return "", "", errors.New("failed to parse base64 basic credentials")
-	}
-
-	s = strings.SplitN(string(c), ":", 2)
-	if len(s) != 2 {
-		return "", "", errors.New("failed to parse basic credentials")
-	}
-
-	return s[0], s[1], nil
 }

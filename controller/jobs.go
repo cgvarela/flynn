@@ -1,68 +1,135 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-sql"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/pq"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/go-martini/martini"
+	"github.com/flynn/flynn/controller/schema"
 	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/flynn/controller/utils"
+	"github.com/flynn/flynn/host/resource"
 	"github.com/flynn/flynn/host/types"
+	"github.com/flynn/flynn/pkg/attempt"
 	"github.com/flynn/flynn/pkg/cluster"
-	"github.com/flynn/flynn/pkg/sse"
+	"github.com/flynn/flynn/pkg/ctxhelper"
+	"github.com/flynn/flynn/pkg/httphelper"
+	"github.com/flynn/flynn/pkg/postgres"
+	"github.com/flynn/flynn/pkg/random"
+	"github.com/jackc/pgx"
+	"golang.org/x/net/context"
 )
 
+/* Job Stuff */
 type JobRepo struct {
-	db *DB
+	db *postgres.DB
 }
 
-func NewJobRepo(db *DB) *JobRepo {
+func NewJobRepo(db *postgres.DB) *JobRepo {
 	return &JobRepo{db}
 }
 
+func (r *JobRepo) Get(id string) (*ct.Job, error) {
+	if !idPattern.MatchString(id) {
+		var err error
+		id, err = cluster.ExtractUUID(id)
+		if err != nil {
+			return nil, ErrNotFound
+		}
+	}
+	row := r.db.QueryRow("job_select", id)
+	return scanJob(row)
+}
+
 func (r *JobRepo) Add(job *ct.Job) error {
-	hostID, jobID, err := cluster.ParseJobID(job.ID)
-	if err != nil {
-		log.Printf("Unable to parse hostID from %q", job.ID)
-		return ErrNotFound
-	}
-	// TODO: actually validate
-	err = r.db.QueryRow("INSERT INTO job_cache (job_id, host_id, app_id, release_id, process_type, state) VALUES ($1, $2, $3, $4, $5, $6) RETURNING created_at, updated_at",
-		jobID, hostID, job.AppID, job.ReleaseID, job.Type, job.State).Scan(&job.CreatedAt, &job.UpdatedAt)
-	if e, ok := err.(*pq.Error); ok && e.Code.Name() == "unique_violation" {
-		err = r.db.QueryRow("UPDATE job_cache SET state = $3, updated_at = now() WHERE job_id = $1 AND host_id = $2 RETURNING created_at, updated_at",
-			jobID, hostID, job.State).Scan(&job.CreatedAt, &job.UpdatedAt)
-	}
+	tx, err := r.db.Begin()
 	if err != nil {
 		return err
 	}
-	return r.db.Exec("INSERT INTO job_events (job_id, host_id, app_id, state) VALUES ($1, $2, $3, $4)", jobID, hostID, job.AppID, job.State)
+
+	// TODO: actually validate
+	err = tx.QueryRow(
+		"job_insert",
+		job.ID,
+		job.UUID,
+		job.HostID,
+		job.AppID,
+		job.ReleaseID,
+		job.Type,
+		string(job.State),
+		job.Meta,
+		job.ExitStatus,
+		job.HostError,
+		job.RunAt,
+		job.Restarts,
+		job.Args,
+	).Scan(&job.CreatedAt, &job.UpdatedAt)
+	if postgres.IsPostgresCode(err, postgres.CheckViolation) {
+		tx.Rollback()
+		return ct.ValidationError{Field: "state", Message: err.Error()}
+	}
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	for i, volID := range job.VolumeIDs {
+		if err := tx.Exec("job_volume_insert", job.UUID, volID, i); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+
+	// create a job event, ignoring possible duplications
+	uniqueID := strings.Join([]string{job.UUID, string(job.State)}, "|")
+	if err := tx.Exec("event_insert_unique", job.AppID, job.UUID, uniqueID, string(ct.EventTypeJob), job); err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	return tx.Commit()
 }
 
-func scanJob(s Scanner) (*ct.Job, error) {
+func scanJob(s postgres.Scanner) (*ct.Job, error) {
 	job := &ct.Job{}
-	err := s.Scan(&job.ID, &job.AppID, &job.ReleaseID, &job.Type, &job.State, &job.CreatedAt, &job.UpdatedAt)
+	var state string
+	var volumeIDs string
+	err := s.Scan(
+		&job.ID,
+		&job.UUID,
+		&job.HostID,
+		&job.AppID,
+		&job.ReleaseID,
+		&job.Type,
+		&state,
+		&job.Meta,
+		&job.ExitStatus,
+		&job.HostError,
+		&job.RunAt,
+		&job.Restarts,
+		&job.CreatedAt,
+		&job.UpdatedAt,
+		&job.Args,
+		&volumeIDs,
+	)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if err == pgx.ErrNoRows {
 			err = ErrNotFound
 		}
 		return nil, err
 	}
-	job.AppID = cleanUUID(job.AppID)
-	job.ReleaseID = cleanUUID(job.ReleaseID)
+	job.State = ct.JobState(state)
+	if volumeIDs != "" {
+		job.VolumeIDs = split(volumeIDs[1:len(volumeIDs)-1], ",")
+	}
 	return job, nil
 }
 
 func (r *JobRepo) List(appID string) ([]*ct.Job, error) {
-	rows, err := r.db.Query("SELECT concat(host_id, '-', job_id), app_id, release_id, process_type, state, created_at, updated_at FROM job_cache WHERE app_id = $1 ORDER BY created_at DESC", appID)
+	rows, err := r.db.Query("job_list", appID)
 	if err != nil {
 		return nil, err
 	}
@@ -78,396 +145,217 @@ func (r *JobRepo) List(appID string) ([]*ct.Job, error) {
 	return jobs, nil
 }
 
-func (r *JobRepo) listEvents(appID string, sinceID int64, count int) ([]*ct.JobEvent, error) {
-	query := "SELECT event_id, concat(job_events.host_id, '-', job_events.job_id), job_events.app_id, job_cache.release_id, job_cache.process_type, job_events.state, job_events.created_at FROM job_events INNER JOIN job_cache ON job_events.job_id = job_cache.job_id AND job_events.host_id = job_cache.host_id WHERE job_events.app_id = $1 AND event_id > $2 ORDER BY event_id DESC"
-	args := []interface{}{appID, sinceID}
-	if count > 0 {
-		query += " LIMIT $3"
-		args = append(args, count)
-	}
-	rows, err := r.db.Query(query, args...)
+func (r *JobRepo) ListActive() ([]*ct.Job, error) {
+	rows, err := r.db.Query("job_list_active")
 	if err != nil {
 		return nil, err
 	}
-	var events []*ct.JobEvent
+	jobs := []*ct.Job{}
 	for rows.Next() {
-		event, err := scanJobEvent(rows)
+		job, err := scanJob(rows)
 		if err != nil {
 			rows.Close()
 			return nil, err
 		}
-		events = append(events, event)
+		jobs = append(jobs, job)
 	}
-	return events, nil
+	return jobs, nil
 }
 
-func (r *JobRepo) getEvent(eventID int64) (*ct.JobEvent, error) {
-	row := r.db.QueryRow("SELECT event_id, concat(job_events.host_id, '-', job_events.job_id), job_events.app_id, job_cache.release_id, job_cache.process_type, job_events.state, job_events.created_at FROM job_events INNER JOIN job_cache ON job_events.job_id = job_cache.job_id AND job_events.host_id = job_cache.host_id WHERE job_events.event_id = $1", eventID)
-	return scanJobEvent(row)
-}
-
-func scanJobEvent(s Scanner) (*ct.JobEvent, error) {
-	event := &ct.JobEvent{}
-	err := s.Scan(&event.ID, &event.JobID, &event.AppID, &event.ReleaseID, &event.Type, &event.State, &event.CreatedAt)
+func (c *controllerAPI) ListJobs(ctx context.Context, w http.ResponseWriter, req *http.Request) {
+	app := c.getApp(ctx)
+	list, err := c.jobRepo.List(app.ID)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		respondWithError(w, err)
+		return
+	}
+	httphelper.JSON(w, 200, list)
+}
+
+func (c *controllerAPI) ListActiveJobs(ctx context.Context, w http.ResponseWriter, req *http.Request) {
+	list, err := c.jobRepo.ListActive()
+	if err != nil {
+		respondWithError(w, err)
+		return
+	}
+	httphelper.JSON(w, 200, list)
+}
+
+func (c *controllerAPI) GetJob(ctx context.Context, w http.ResponseWriter, req *http.Request) {
+	params, _ := ctxhelper.ParamsFromContext(ctx)
+	job, err := c.jobRepo.Get(params.ByName("jobs_id"))
+	if err != nil {
+		respondWithError(w, err)
+		return
+	}
+	httphelper.JSON(w, 200, job)
+}
+
+func (c *controllerAPI) PutJob(ctx context.Context, w http.ResponseWriter, req *http.Request) {
+	var job ct.Job
+	if err := httphelper.DecodeJSON(req, &job); err != nil {
+		respondWithError(w, err)
+		return
+	}
+
+	if err := schema.Validate(job); err != nil {
+		respondWithError(w, err)
+		return
+	}
+
+	if err := c.jobRepo.Add(&job); err != nil {
+		respondWithError(w, err)
+		return
+	}
+	httphelper.JSON(w, 200, &job)
+}
+
+func (c *controllerAPI) KillJob(ctx context.Context, w http.ResponseWriter, req *http.Request) {
+	params, _ := ctxhelper.ParamsFromContext(ctx)
+	job, err := c.jobRepo.Get(params.ByName("jobs_id"))
+	if err != nil {
+		respondWithError(w, err)
+		return
+	} else if job.HostID == "" {
+		httphelper.ValidationError(w, "", "cannot kill a job which has not been placed on a host")
+		return
+	}
+
+	client, err := c.clusterClient.Host(job.HostID)
+	if err != nil {
+		respondWithError(w, err)
+		return
+	}
+
+	if err = client.StopJob(job.ID); err != nil {
+		if _, ok := err.(ct.NotFoundError); ok {
 			err = ErrNotFound
 		}
-		return nil, err
-	}
-	event.AppID = cleanUUID(event.AppID)
-	event.ReleaseID = cleanUUID(event.ReleaseID)
-	return event, nil
-}
-
-type clusterClient interface {
-	ListHosts() (map[string]host.Host, error)
-	DialHost(string) (cluster.Host, error)
-	AddJobs(*host.AddJobsReq) (*host.AddJobsRes, error)
-}
-
-func listJobs(req *http.Request, w http.ResponseWriter, app *ct.App, repo *JobRepo, r ResponseHelper) {
-	if strings.Contains(req.Header.Get("Accept"), "text/event-stream") {
-		if err := streamJobs(req, w, app, repo); err != nil {
-			r.Error(err)
-		}
+		respondWithError(w, err)
 		return
 	}
-	list, err := repo.List(app.ID)
+}
+
+var runJobAttempts = attempt.Strategy{
+	Total: 30 * time.Second,
+	Delay: 100 * time.Millisecond,
+}
+
+func (c *controllerAPI) RunJob(ctx context.Context, w http.ResponseWriter, req *http.Request) {
+	var newJob ct.NewJob
+	if err := httphelper.DecodeJSON(req, &newJob); err != nil {
+		respondWithError(w, err)
+		return
+	}
+
+	if err := schema.Validate(newJob); err != nil {
+		respondWithError(w, err)
+		return
+	}
+
+	data, err := c.releaseRepo.Get(newJob.ReleaseID)
 	if err != nil {
-		r.Error(err)
-		return
-	}
-	r.JSON(200, list)
-}
-
-func putJob(job ct.Job, app *ct.App, repo *JobRepo, r ResponseHelper) {
-	job.AppID = app.ID
-	if err := repo.Add(&job); err != nil {
-		r.Error(err)
-		return
-	}
-	r.JSON(200, &job)
-}
-
-func jobLog(req *http.Request, app *ct.App, params martini.Params, hc cluster.Host, w http.ResponseWriter, r ResponseHelper) {
-	attachReq := &host.AttachReq{
-		JobID: params["jobs_id"],
-		Flags: host.AttachFlagStdout | host.AttachFlagStderr | host.AttachFlagLogs,
-	}
-	tail := req.FormValue("tail") != ""
-	if tail {
-		attachReq.Flags |= host.AttachFlagStream
-	}
-	wait := req.FormValue("wait") != ""
-	attachClient, err := hc.Attach(attachReq, wait)
-	if err != nil {
-		if err == cluster.ErrWouldWait {
-			w.WriteHeader(404)
-		} else {
-			r.Error(err)
-		}
-		return
-	}
-
-	if cn, ok := w.(http.CloseNotifier); ok {
-		go func() {
-			<-cn.CloseNotify()
-			attachClient.Close()
-		}()
-	} else {
-		defer attachClient.Close()
-	}
-
-	sse := strings.Contains(req.Header.Get("Accept"), "text/event-stream")
-	if sse {
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	} else {
-		w.Header().Set("Content-Type", "application/vnd.flynn.attach")
-	}
-	w.WriteHeader(200)
-	// Send headers right away if tailing
-	if wf, ok := w.(http.Flusher); ok && tail {
-		wf.Flush()
-	}
-
-	fw := flushWriter{w, tail}
-	if sse {
-		ssew := NewSSELogWriter(w)
-		exit, err := attachClient.Receive(flushWriter{ssew.Stream("stdout"), tail}, flushWriter{ssew.Stream("stderr"), tail})
-		if err != nil {
-			fw.Write([]byte("event: error\ndata: {}\n\n"))
-			return
-		}
-		if tail {
-			fmt.Fprintf(fw, "event: exit\ndata: {\"status\": %d}\n\n", exit)
-			return
-		}
-		fw.Write([]byte("event: eof\ndata: {}\n\n"))
-	} else {
-		io.Copy(fw, attachClient.Conn())
-	}
-}
-
-func streamJobs(req *http.Request, w http.ResponseWriter, app *ct.App, repo *JobRepo) (err error) {
-	var lastID int64
-	if req.Header.Get("Last-Event-Id") != "" {
-		lastID, err = strconv.ParseInt(req.Header.Get("Last-Event-Id"), 10, 64)
-		if err != nil {
-			return ct.ValidationError{Field: "Last-Event-Id", Message: "is invalid"}
-		}
-	}
-	var count int
-	if req.FormValue("count") != "" {
-		count, err = strconv.Atoi(req.FormValue("count"))
-		if err != nil {
-			return ct.ValidationError{Field: "count", Message: "is invalid"}
-		}
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-
-	sendKeepAlive := func() error {
-		if _, err := w.Write([]byte(":\n")); err != nil {
-			return err
-		}
-		w.(http.Flusher).Flush()
-		return nil
-	}
-	if err = sendKeepAlive(); err != nil {
-		return
-	}
-
-	sendJobEvent := func(e *ct.JobEvent) error {
-		if _, err := fmt.Fprintf(w, "id: %d\nevent: %s\ndata: ", e.ID, e.State); err != nil {
-			return err
-		}
-		if err := json.NewEncoder(w).Encode(e); err != nil {
-			return err
-		}
-		if _, err := w.Write([]byte("\n")); err != nil {
-			return err
-		}
-		w.(http.Flusher).Flush()
-		return nil
-	}
-
-	connected := make(chan struct{})
-	done := make(chan struct{})
-	listenEvent := func(ev pq.ListenerEventType, listenErr error) {
-		switch ev {
-		case pq.ListenerEventConnected:
-			close(connected)
-		case pq.ListenerEventDisconnected:
-			close(done)
-		case pq.ListenerEventConnectionAttemptFailed:
-			err = listenErr
-			close(done)
-		}
-	}
-	listener := pq.NewListener(repo.db.DSN(), 10*time.Second, time.Minute, listenEvent)
-	defer listener.Close()
-	listener.Listen("job_events:" + formatUUID(app.ID))
-
-	var currID int64
-	if lastID > 0 || count > 0 {
-		events, err := repo.listEvents(app.ID, lastID, count)
-		if err != nil {
-			return err
-		}
-		// events are in ID DESC order, so iterate in reverse
-		for i := len(events) - 1; i >= 0; i-- {
-			e := events[i]
-			if err := sendJobEvent(e); err != nil {
-				return err
-			}
-			currID = e.ID
-		}
-	}
-
-	select {
-	case <-done:
-		return
-	case <-connected:
-	}
-
-	closed := w.(http.CloseNotifier).CloseNotify()
-	for {
-		select {
-		case <-done:
-			return
-		case <-closed:
-			return
-		case <-time.After(30 * time.Second):
-			if err := sendKeepAlive(); err != nil {
-				return err
-			}
-		case n := <-listener.Notify:
-			id, err := strconv.ParseInt(n.Extra, 10, 64)
-			if err != nil {
-				return err
-			}
-			if id <= currID {
-				continue
-			}
-			e, err := repo.getEvent(id)
-			if err != nil {
-				return err
-			}
-			if err = sendJobEvent(e); err != nil {
-				return err
-			}
-		}
-	}
-}
-
-type SSELogWriter interface {
-	Stream(string) io.Writer
-}
-
-func NewSSELogWriter(w io.Writer) SSELogWriter {
-	return &sseLogWriter{SSEWriter: &sse.Writer{Writer: w}}
-}
-
-type sseLogWriter struct {
-	sse.SSEWriter
-}
-
-func (w *sseLogWriter) Stream(s string) io.Writer {
-	return &sseLogStreamWriter{w: w, s: s}
-}
-
-type sseLogStreamWriter struct {
-	w *sseLogWriter
-	s string
-}
-
-type sseLogChunk struct {
-	Stream string `json:"stream"`
-	Data   string `json:"data"`
-}
-
-func (w *sseLogStreamWriter) Write(p []byte) (int, error) {
-	data, err := json.Marshal(&sseLogChunk{Stream: w.s, Data: string(p)})
-	if err != nil {
-		return 0, err
-	}
-	if _, err := w.w.Write(data); err != nil {
-		return 0, err
-	}
-	return len(p), err
-}
-
-func (w *sseLogStreamWriter) Flush() {
-	if fw, ok := w.w.SSEWriter.(http.Flusher); ok {
-		fw.Flush()
-	}
-}
-
-type flushWriter struct {
-	w  io.Writer
-	ok bool
-}
-
-func (f flushWriter) Write(p []byte) (int, error) {
-	if f.ok {
-		defer func() {
-			if fw, ok := f.w.(http.Flusher); ok {
-				fw.Flush()
-			}
-		}()
-	}
-	return f.w.Write(p)
-}
-
-func formatUUID(s string) string {
-	return s[:8] + "-" + s[8:12] + "-" + s[12:16] + "-" + s[16:20] + "-" + s[20:]
-}
-
-func connectHostMiddleware(c martini.Context, params martini.Params, cl clusterClient, r ResponseHelper) {
-	hostID, jobID, err := cluster.ParseJobID(params["jobs_id"])
-	if err != nil {
-		log.Printf("Unable to parse hostID from %q", params["jobs_id"])
-		r.Error(ErrNotFound)
-		return
-	}
-	params["jobs_id"] = jobID
-
-	client, err := cl.DialHost(hostID)
-	if err != nil {
-		r.Error(err)
-		return
-	}
-	c.MapTo(client, (*cluster.Host)(nil))
-
-	c.Next()
-	client.Close()
-}
-
-func killJob(app *ct.App, params martini.Params, client cluster.Host, r ResponseHelper) {
-	if err := client.StopJob(params["jobs_id"]); err != nil {
-		r.Error(err)
-		return
-	}
-}
-
-func runJob(app *ct.App, newJob ct.NewJob, releases *ReleaseRepo, artifacts *ArtifactRepo, cl clusterClient, req *http.Request, w http.ResponseWriter, r ResponseHelper) {
-	data, err := releases.Get(newJob.ReleaseID)
-	if err != nil {
-		r.Error(err)
+		respondWithError(w, err)
 		return
 	}
 	release := data.(*ct.Release)
-	data, err = artifacts.Get(release.ArtifactID)
-	if err != nil {
-		r.Error(err)
+	var artifactIDs []string
+	if len(newJob.ArtifactIDs) > 0 {
+		artifactIDs = newJob.ArtifactIDs
+	} else if len(release.ArtifactIDs) > 0 {
+		artifactIDs = release.ArtifactIDs
+	} else {
+		httphelper.ValidationError(w, "release.ArtifactIDs", "cannot be empty")
 		return
 	}
-	artifact := data.(*ct.Artifact)
-	attach := strings.Contains(req.Header.Get("Accept"), "application/vnd.flynn.attach")
 
-	env := make(map[string]string, len(release.Env)+len(newJob.Env))
-	for k, v := range release.Env {
+	artifacts := make([]*ct.Artifact, len(artifactIDs))
+	artifactList, err := c.artifactRepo.ListIDs(artifactIDs...)
+	if err != nil {
+		respondWithError(w, err)
+		return
+	}
+	for i, id := range artifactIDs {
+		artifacts[i] = artifactList[id]
+	}
+
+	var entrypoint ct.ImageEntrypoint
+	if e := utils.GetEntrypoint(artifacts, ""); e != nil {
+		entrypoint = *e
+	}
+
+	attach := strings.Contains(req.Header.Get("Upgrade"), "flynn-attach/0")
+
+	hosts, err := c.clusterClient.Hosts()
+	if err != nil {
+		respondWithError(w, err)
+		return
+	}
+	if len(hosts) == 0 {
+		respondWithError(w, errors.New("no hosts found"))
+		return
+	}
+	client := hosts[random.Math.Intn(len(hosts))]
+
+	uuid := random.UUID()
+	hostID := client.ID()
+	id := cluster.GenerateJobID(hostID, uuid)
+	app := c.getApp(ctx)
+	env := make(map[string]string, len(entrypoint.Env)+len(release.Env)+len(newJob.Env)+4)
+	env["FLYNN_APP_ID"] = app.ID
+	env["FLYNN_RELEASE_ID"] = release.ID
+	env["FLYNN_PROCESS_TYPE"] = ""
+	env["FLYNN_JOB_ID"] = id
+	for k, v := range entrypoint.Env {
 		env[k] = v
+	}
+	if newJob.ReleaseEnv {
+		for k, v := range release.Env {
+			env[k] = v
+		}
 	}
 	for k, v := range newJob.Env {
 		env[k] = v
 	}
+	metadata := make(map[string]string, len(newJob.Meta)+3)
+	for k, v := range newJob.Meta {
+		metadata[k] = v
+	}
+	metadata["flynn-controller.app"] = app.ID
+	metadata["flynn-controller.app_name"] = app.Name
+	metadata["flynn-controller.release"] = release.ID
 	job := &host.Job{
-		ID: cluster.RandomJobID(""),
-		Metadata: map[string]string{
-			"flynn-controller.app":      app.ID,
-			"flynn-controller.app_name": app.Name,
-			"flynn-controller.release":  release.ID,
-		},
-		Artifact: host.Artifact{
-			Type: artifact.Type,
-			URI:  artifact.URI,
-		},
+		ID:       id,
+		Metadata: metadata,
 		Config: host.ContainerConfig{
-			Cmd:   newJob.Cmd,
-			Env:   env,
-			TTY:   newJob.TTY,
-			Stdin: attach,
+			Args:       entrypoint.Args,
+			Env:        env,
+			WorkingDir: entrypoint.WorkingDir,
+			Uid:        entrypoint.Uid,
+			Gid:        entrypoint.Gid,
+			TTY:        newJob.TTY,
+			Stdin:      attach,
+			DisableLog: newJob.DisableLog,
 		},
+		Resources: newJob.Resources,
+		Partition: string(newJob.Partition),
 	}
-	if len(newJob.Entrypoint) > 0 {
-		job.Config.Entrypoint = newJob.Entrypoint
+	resource.SetDefaults(&job.Resources)
+	if len(newJob.Args) > 0 {
+		job.Config.Args = newJob.Args
 	}
+	if typ := newJob.MountsFrom; typ != "" {
+		job.Config.Mounts = release.Processes[typ].Mounts
+	}
+	utils.SetupMountspecs(job, artifacts)
 
-	hosts, err := cl.ListHosts()
-	if err != nil {
-		r.Error(err)
-		return
-	}
-	// pick a random host
-	var hostID string
-	for hostID = range hosts {
-		break
-	}
-	if hostID == "" {
-		r.Error(errors.New("no hosts found"))
-		return
+	// provision data volume if required
+	if newJob.Data {
+		vol := &ct.VolumeReq{Path: "/data", DeleteOnStop: true}
+		if _, err := utils.ProvisionVolume(vol, client, job); err != nil {
+			respondWithError(w, err)
+			return
+		}
 	}
 
 	var attachClient cluster.AttachClient
@@ -478,33 +366,32 @@ func runJob(app *ct.App, newJob ct.NewJob, releases *ReleaseRepo, artifacts *Art
 			Height: uint16(newJob.Lines),
 			Width:  uint16(newJob.Columns),
 		}
-		client, err := cl.DialHost(hostID)
-		if err != nil {
-			r.Error(fmt.Errorf("host connect failed: %s", err.Error()))
-			return
-		}
-		defer client.Close()
 		attachClient, err = client.Attach(attachReq, true)
 		if err != nil {
-			r.Error(fmt.Errorf("attach failed: %s", err.Error()))
+			respondWithError(w, fmt.Errorf("attach failed: %s", err.Error()))
 			return
 		}
 		defer attachClient.Close()
 	}
 
-	_, err = cl.AddJobs(&host.AddJobsReq{HostJobs: map[string][]*host.Job{hostID: {job}}})
+	err = runJobAttempts.RunWithValidator(func() error {
+		return client.AddJob(job)
+	}, httphelper.IsRetryableError)
 	if err != nil {
-		r.Error(fmt.Errorf("schedule failed: %s", err.Error()))
+		respondWithError(w, fmt.Errorf("schedule failed: %s", err.Error()))
 		return
 	}
 
 	if attach {
+		// TODO(titanous): This Wait could block indefinitely if something goes
+		// wrong, a context should be threaded in that cancels if the client
+		// goes away.
 		if err := attachClient.Wait(); err != nil {
-			r.Error(fmt.Errorf("attach wait failed: %s", err.Error()))
+			respondWithError(w, fmt.Errorf("attach wait failed: %s", err.Error()))
 			return
 		}
-		w.Header().Set("Content-Type", "application/vnd.flynn.attach")
-		w.Header().Set("Content-Length", "0")
+		w.Header().Set("Connection", "upgrade")
+		w.Header().Set("Upgrade", "flynn-attach/0")
 		w.WriteHeader(http.StatusSwitchingProtocols)
 		conn, _, err := w.(http.Hijacker).Hijack()
 		if err != nil {
@@ -519,15 +406,20 @@ func runJob(app *ct.App, newJob ct.NewJob, releases *ReleaseRepo, artifacts *Art
 		}
 		go cp(conn, attachClient.Conn())
 		go cp(attachClient.Conn(), conn)
-		<-done
+
+		// Wait for one of the connections to be closed or interrupted. EOF is
+		// framed inside the attach protocol, so a read/write error indicates
+		// that we're done and should clean up.
 		<-done
 
 		return
 	} else {
-		r.JSON(200, &ct.Job{
-			ID:        hostID + "-" + job.ID,
+		httphelper.JSON(w, 200, &ct.Job{
+			ID:        job.ID,
+			UUID:      uuid,
+			HostID:    hostID,
 			ReleaseID: newJob.ReleaseID,
-			Cmd:       newJob.Cmd,
+			Args:      newJob.Args,
 		})
 	}
 }

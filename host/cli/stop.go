@@ -4,8 +4,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
 	"github.com/flynn/flynn/pkg/cluster"
+	"github.com/flynn/go-docopt"
 )
 
 func init() {
@@ -17,9 +17,9 @@ Stop running jobs`)
 
 func runStop(args *docopt.Args, client *cluster.Client) error {
 	success := true
-	clients := make(map[string]cluster.Host)
+	clients := make(map[string]*cluster.Host)
 	for _, id := range args.All["ID"].([]string) {
-		hostID, jobID, err := cluster.ParseJobID(id)
+		hostID, err := cluster.ExtractHostID(id)
 		if err != nil {
 			fmt.Printf("could not parse %s: %s", id, err)
 			success = false
@@ -28,21 +28,20 @@ func runStop(args *docopt.Args, client *cluster.Client) error {
 		hostClient, ok := clients[hostID]
 		if !ok {
 			var err error
-			hostClient, err = client.DialHost(hostID)
+			hostClient, err = client.Host(hostID)
 			if err != nil {
 				fmt.Printf("could not connect to host %s: %s\n", hostID, err)
 				success = false
 				continue
 			}
-			defer hostClient.Close()
 			clients[hostID] = hostClient
 		}
-		if err := hostClient.StopJob(jobID); err != nil {
-			fmt.Printf("could not stop job %s: %s\n", jobID, err)
+		if err := hostClient.StopJob(id); err != nil {
+			fmt.Printf("could not stop job %s: %s\n", id, err)
 			success = false
 			continue
 		}
-		fmt.Println(jobID, "stopped")
+		fmt.Println(id, "stopped")
 	}
 	if !success {
 		return errors.New("could not stop all jobs")

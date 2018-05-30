@@ -1,114 +1,191 @@
 package main
 
 import (
-	"bytes"
 	"crypto/md5"
-	"crypto/rand"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
-	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
-	"net/http/httputil"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/code.google.com/p/go.crypto/nacl/secretbox"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/inconshreveable/go-vhost"
+	"github.com/flynn/flynn/discoverd/cache"
 	"github.com/flynn/flynn/discoverd/client"
+	"github.com/flynn/flynn/pkg/ctxhelper"
 	"github.com/flynn/flynn/pkg/random"
+	"github.com/flynn/flynn/pkg/stream"
+	"github.com/flynn/flynn/pkg/tlsconfig"
+	"github.com/flynn/flynn/router/proxy"
+	"github.com/flynn/flynn/router/proxyproto"
 	"github.com/flynn/flynn/router/types"
+	"golang.org/x/net/context"
+	"golang.org/x/net/http2"
 )
 
 type HTTPListener struct {
 	Watcher
 	DataStoreReader
 
-	Addr      string
-	TLSAddr   string
-	TLSConfig *tls.Config
+	Addrs    []string
+	TLSAddrs []string
+
+	defaultPorts []int
 
 	mtx      sync.RWMutex
-	domains  map[string]*httpRoute
+	domains  map[string]*node
 	routes   map[string]*httpRoute
-	services map[string]*httpService
+	services map[string]*service
 
 	discoverd DiscoverdClient
 	ds        DataStore
 	wm        *WatchManager
+	stopSync  func()
 
-	listener    net.Listener
-	tlsListener net.Listener
-	closed      bool
-	cookieKey   *[32]byte
+	listeners     []net.Listener
+	tlsListeners  []net.Listener
+	closed        bool
+	cookieKey     *[32]byte
+	keypair       tls.Certificate
+	proxyProtocol bool
+
+	error503Page []byte
+
+	preSync  func()
+	postSync func(<-chan struct{})
 }
 
 type DiscoverdClient interface {
-	NewServiceSet(string) (discoverd.ServiceSet, error)
-}
-
-func NewHTTPListener(addr, tlsAddr string, cookieKey *[32]byte, ds DataStore, discoverdc DiscoverdClient) *HTTPListener {
-	l := &HTTPListener{
-		Addr:      addr,
-		TLSAddr:   tlsAddr,
-		ds:        ds,
-		discoverd: discoverdc,
-		routes:    make(map[string]*httpRoute),
-		domains:   make(map[string]*httpRoute),
-		services:  make(map[string]*httpService),
-		wm:        NewWatchManager(),
-		cookieKey: cookieKey,
-	}
-	if cookieKey == nil {
-		var k [32]byte
-		l.cookieKey = &k
-	}
-	l.Watcher = l.wm
-	l.DataStoreReader = l.ds
-	return l
+	Service(string) discoverd.Service
+	AddService(string, *discoverd.ServiceConfig) error
 }
 
 func (s *HTTPListener) Close() error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
-	for _, service := range s.services {
-		service.ss.Close()
+	if s.closed {
+		return nil
 	}
-	s.listener.Close()
-	s.tlsListener.Close()
-	s.ds.StopSync()
+	s.stopSync()
+	for _, service := range s.services {
+		service.sc.Close()
+	}
+	for _, listener := range s.listeners {
+		listener.Close()
+	}
+	for _, listener := range s.tlsListeners {
+		listener.Close()
+	}
 	s.closed = true
 	return nil
 }
 
 func (s *HTTPListener) Start() error {
-	started := make(chan error)
+	ctx := context.Background() // TODO(benburkert): make this an argument
+	ctx, s.stopSync = context.WithCancel(ctx)
 
-	go s.ds.Sync(&httpSyncHandler{l: s}, started)
-	if err := <-started; err != nil {
+	if s.Watcher != nil {
+		return errors.New("router: http listener already started")
+	}
+	if s.wm == nil {
+		s.wm = NewWatchManager()
+	}
+	s.Watcher = s.wm
+
+	if s.ds == nil {
+		return errors.New("router: http listener missing data store")
+	}
+	s.DataStoreReader = s.ds
+
+	s.routes = make(map[string]*httpRoute)
+	s.domains = make(map[string]*node)
+	s.services = make(map[string]*service)
+
+	if s.cookieKey == nil {
+		s.cookieKey = &[32]byte{}
+	}
+
+	if err := s.startSync(ctx); err != nil {
+		s.Close()
 		return err
 	}
 
-	go s.serve(started)
-	if err := <-started; err != nil {
-		s.ds.StopSync()
+	if err := s.startListen(); err != nil {
+		s.Close()
 		return err
 	}
-	s.Addr = s.listener.Addr().String()
 
-	go s.serveTLS(started)
-	if err := <-started; err != nil {
-		s.ds.StopSync()
-		s.listener.Close()
+	return nil
+}
+
+func (s *HTTPListener) startSync(ctx context.Context) error {
+	errc := make(chan error)
+	startc := s.doSync(ctx, errc)
+
+	select {
+	case err := <-errc:
+		return err
+	case <-startc:
+		go s.runSync(ctx, errc)
+		return nil
+	}
+}
+
+func (s *HTTPListener) runSync(ctx context.Context, errc chan error) {
+	err := <-errc
+
+	for {
+		if err == nil {
+			return
+		}
+		log.Printf("router: sync error: %s", err)
+
+		time.Sleep(2 * time.Second)
+
+		if s.preSync != nil {
+			s.preSync()
+		}
+
+		startc := s.doSync(ctx, errc)
+
+		if s.postSync != nil {
+			s.postSync(startc)
+		}
+
+		err = <-errc
+	}
+}
+
+func (s *HTTPListener) doSync(ctx context.Context, errc chan<- error) <-chan struct{} {
+	startc := make(chan struct{})
+
+	go func() { errc <- s.ds.Sync(ctx, &httpSyncHandler{l: s}, startc) }()
+
+	return startc
+}
+
+func (s *HTTPListener) startListen() error {
+	if err := s.listenAndServe(); err != nil {
+		s.Close()
 		return err
 	}
-	s.TLSAddr = s.tlsListener.Addr().String()
+	s.Addrs = make([]string, len(s.listeners))
+	for i, listener := range s.listeners {
+		s.Addrs[i] = listener.Addr().String()
+	}
+
+	if err := s.listenAndServeTLS(); err != nil {
+		s.Close()
+		return err
+	}
+	s.TLSAddrs = make([]string, len(s.tlsListeners))
+	for i, listener := range s.tlsListeners {
+		s.TLSAddrs[i] = listener.Addr().String()
+	}
 
 	return nil
 }
@@ -121,18 +198,33 @@ func (s *HTTPListener) AddRoute(r *router.Route) error {
 	if s.closed {
 		return ErrClosed
 	}
-	r.ID = md5sum(r.HTTPRoute().Domain)
-	return s.ds.Add(r)
+	if r.Port == 0 {
+		return s.ds.Add(r)
+	}
+
+	// If not using default ports, check that the port is reserved, first
+	addrs := s.Addrs
+	err := ErrUnreservedHTTP
+	if r.LegacyTLSCert != "" {
+		addrs = s.TLSAddrs
+		err = ErrUnreservedHTTPS
+	}
+	for _, addr := range addrs {
+		_, port, _ := net.SplitHostPort(addr)
+		if port == strconv.Itoa(int(r.Port)) {
+			return s.ds.Add(r)
+		}
+	}
+	return err
 }
 
-func (s *HTTPListener) SetRoute(r *router.Route) error {
+func (s *HTTPListener) UpdateRoute(r *router.Route) error {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 	if s.closed {
 		return ErrClosed
 	}
-	r.ID = md5sum(r.HTTPRoute().Domain)
-	return s.ds.Set(r)
+	return s.ds.Update(r)
 }
 
 func md5sum(data string) string {
@@ -149,22 +241,77 @@ func (s *HTTPListener) RemoveRoute(id string) error {
 	return s.ds.Remove(id)
 }
 
+func (s *HTTPListener) AddCert(cert *router.Certificate) error {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	if s.closed {
+		return ErrClosed
+	}
+	return s.ds.AddCert(cert)
+}
+
+func (s *HTTPListener) GetCert(id string) (*router.Certificate, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
+	return s.ds.GetCert(id)
+}
+
+func (s *HTTPListener) GetCertRoutes(id string) ([]*router.Route, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
+	return s.ds.ListCertRoutes(id)
+}
+
+func (s *HTTPListener) GetCerts() ([]*router.Certificate, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
+	return s.ds.ListCerts()
+}
+
+func (s *HTTPListener) RemoveCert(id string) error {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	if s.closed {
+		return ErrClosed
+	}
+	return s.ds.RemoveCert(id)
+}
+
 type httpSyncHandler struct {
 	l *HTTPListener
+}
+
+func (h *httpSyncHandler) Current() map[string]struct{} {
+	h.l.mtx.RLock()
+	defer h.l.mtx.RUnlock()
+	ids := make(map[string]struct{}, len(h.l.routes))
+	for id := range h.l.routes {
+		ids[id] = struct{}{}
+	}
+	return ids
 }
 
 func (h *httpSyncHandler) Set(data *router.Route) error {
 	route := data.HTTPRoute()
 	r := &httpRoute{HTTPRoute: route}
+	cert := r.Certificate
 
-	if r.TLSCert != "" && r.TLSKey != "" {
-		kp, err := tls.X509KeyPair([]byte(r.TLSCert), []byte(r.TLSKey))
+	if cert != nil && cert.Cert != "" && cert.Key != "" {
+		kp, err := tls.X509KeyPair([]byte(cert.Cert), []byte(cert.Key))
 		if err != nil {
 			return err
 		}
 		r.keypair = &kp
-		r.TLSCert = ""
-		r.TLSKey = ""
+		r.Certificate = nil
 	}
 
 	h.l.mtx.Lock()
@@ -177,25 +324,47 @@ func (h *httpSyncHandler) Set(data *router.Route) error {
 	if service != nil && service.name != r.Service {
 		service.refs--
 		if service.refs <= 0 {
-			service.ss.Close()
+			service.Close()
 			delete(h.l.services, service.name)
 		}
 		service = nil
 	}
 	if service == nil {
-		ss, err := h.l.discoverd.NewServiceSet(r.Service)
+		sc, err := cache.New(h.l.discoverd.Service(r.Service))
 		if err != nil {
 			return err
 		}
-		service = &httpService{name: r.Service, ss: ss, cookieKey: h.l.cookieKey}
+
+		service = newService(r.Service, sc, h.l.wm, r.DrainBackends)
 		h.l.services[r.Service] = service
 	}
 	service.refs++
+	var bf proxy.BackendListFunc
+	if r.Leader {
+		bf = backendFunc(r.Service, service.sc.Leader)
+	} else {
+		bf = backendFunc(r.Service, service.sc.Instances)
+	}
+	r.rp = proxy.NewReverseProxy(bf, h.l.cookieKey, r.Sticky, service, logger.New("service", r.Service))
+	r.rp.Error503Page = h.l.error503Page
 	r.service = service
 	h.l.routes[data.ID] = r
-	h.l.domains[r.Domain] = r
+	domain := net.JoinHostPort(strings.ToLower(r.Domain), strconv.Itoa(r.Port))
+	if data.Path == "/" {
+		if tree, ok := h.l.domains[domain]; ok {
+			tree.backend = r
+		} else {
+			h.l.domains[domain] = NewTree(r)
+		}
+	} else {
+		if tree, ok := h.l.domains[domain]; ok {
+			tree.Insert(r.Path, r)
+		} else {
+			logger.Error("Failed insert of path based route, consistency violation.")
+		}
+	}
 
-	go h.l.wm.Send(&router.Event{Event: "set", ID: r.Domain})
+	go h.l.wm.Send(&router.Event{Event: router.EventTypeRouteSet, ID: domain, Route: r.ToRoute()})
 	return nil
 }
 
@@ -212,134 +381,168 @@ func (h *httpSyncHandler) Remove(id string) error {
 
 	r.service.refs--
 	if r.service.refs <= 0 {
-		r.service.ss.Close()
+		r.service.sc.Close()
 		delete(h.l.services, r.service.name)
 	}
 
 	delete(h.l.routes, id)
-	delete(h.l.domains, r.Domain)
-	go h.l.wm.Send(&router.Event{Event: "remove", ID: id})
+	domain := net.JoinHostPort(r.Domain, strconv.Itoa(r.Port))
+	if tree, ok := h.l.domains[domain]; ok {
+		if r.Path == "/" && tree.backend == r {
+			delete(h.l.domains, domain)
+		} else if tree.Lookup(r.Path) == r {
+			tree.Remove(r.Path)
+		}
+	}
+	go h.l.wm.Send(&router.Event{Event: router.EventTypeRouteRemove, ID: id, Route: r.ToRoute()})
 	return nil
 }
 
-func (s *HTTPListener) serve(started chan<- error) {
-	var err error
-	s.listener, err = net.Listen("tcp", s.Addr)
-	started <- err
-	if err != nil {
-		return
+func (s *HTTPListener) listenAndServe() error {
+	for _, listener := range s.listeners {
+		listener.Close()
 	}
-	for {
-		conn, err := s.listener.Accept()
+	s.listeners = nil
+	for _, addr := range s.Addrs {
+		listener, err := listenFunc("tcp4", addr)
 		if err != nil {
-			// TODO: log error
-			break
+			return listenErr{addr, err}
 		}
-		go s.handle(conn, false)
+		if s.proxyProtocol {
+			listener = proxyproto.Listener{listener}
+		}
+		s.listeners = append(s.listeners, listener)
+
+		server := &http.Server{
+			Addr: listener.Addr().String(),
+			Handler: fwdProtoHandler{
+				Handler: s,
+				Proto:   "http",
+				Port:    mustPortFromAddr(listener.Addr().String()),
+			},
+		}
+
+		// TODO: log error
+		go server.Serve(listener)
 	}
+	return nil
 }
 
-func (s *HTTPListener) serveTLS(started chan<- error) {
-	var err error
-	s.tlsListener, err = net.Listen("tcp", s.TLSAddr)
-	started <- err
-	if err != nil {
-		return
+var errMissingTLS = errors.New("router: route not found or TLS not configured")
+
+func (s *HTTPListener) listenAndServeTLS() error {
+	for _, listener := range s.tlsListeners {
+		listener.Close()
 	}
-	for {
-		conn, err := s.tlsListener.Accept()
-		if err != nil {
-			// TODO: log error
-			break
+	s.tlsListeners = nil
+	for _, addr := range s.TLSAddrs {
+		port, _ := strconv.Atoi(mustPortFromAddr(addr))
+		certForHandshake := func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			r := s.findRoute(hello.ServerName, port, "/")
+			if r == nil {
+				return nil, errMissingTLS
+			}
+			return r.keypair, nil
 		}
-		go s.handle(conn, true)
+		tlsConfig := tlsconfig.SecureCiphers(&tls.Config{
+			GetCertificate: certForHandshake,
+			Certificates:   []tls.Certificate{s.keypair},
+			NextProtos:     []string{http2.NextProtoTLS, "h2-14"},
+		})
+
+		l, err := listenFunc("tcp4", addr)
+		if err != nil {
+			return listenErr{addr, err}
+		}
+		if s.proxyProtocol {
+			l = proxyproto.Listener{l}
+		}
+		listener := tls.NewListener(l, tlsConfig)
+		s.tlsListeners = append(s.tlsListeners, listener)
+
+		handler := fwdProtoHandler{
+			Handler: s,
+			Proto:   "https",
+			Port:    mustPortFromAddr(listener.Addr().String()),
+		}
+
+		http2Server := &http2.Server{}
+		http2Handler := func(hs *http.Server, c *tls.Conn, h http.Handler) {
+			http2Server.ServeConn(c, &http2.ServeConnOpts{
+				Handler:    handler,
+				BaseConfig: hs,
+			})
+		}
+
+		server := &http.Server{
+			Addr:    listener.Addr().String(),
+			Handler: handler,
+			TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){
+				http2.NextProtoTLS: http2Handler,
+				"h2-14":            http2Handler,
+			},
+		}
+
+		// TODO: log error
+		go server.Serve(listener)
 	}
+
+	return nil
 }
 
-func (s *HTTPListener) findRouteForHost(host string) *httpRoute {
+func (s *HTTPListener) findRoute(host string, portInt int, path string) *httpRoute {
+	host = strings.ToLower(host)
+	if strings.Contains(host, ":") {
+		host, _, _ = net.SplitHostPort(host)
+	}
+	port := strconv.Itoa(portInt)
+	for _, defaultPort := range s.defaultPorts {
+		if defaultPort == portInt {
+			port = "0"
+		}
+	}
+	domain := net.JoinHostPort(host, port)
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
-	if backend, ok := s.domains[host]; ok {
-		return backend
+	if tree, ok := s.domains[domain]; ok {
+		return tree.Lookup(path)
 	}
 	// handle wildcard domains up to 5 subdomains deep, from most-specific to
 	// least-specific
-	d := strings.SplitN(host, ".", 5)
+	d := strings.SplitN(domain, ".", 5)
 	for i := len(d); i > 0; i-- {
-		if backend, ok := s.domains["*."+strings.Join(d[len(d)-i:], ".")]; ok {
-			return backend
+		if tree, ok := s.domains["*."+strings.Join(d[len(d)-i:], ".")]; ok {
+			return tree.Lookup(path)
 		}
+	}
+	// use catch-all if available
+	if tree, ok := s.domains[net.JoinHostPort("*", port)]; ok {
+		return tree.Lookup(path)
 	}
 	return nil
 }
 
-func fail(sc *httputil.ServerConn, req *http.Request, code int, msg string) {
-	resp := &http.Response{
-		StatusCode:    code,
-		ProtoMajor:    1,
-		ProtoMinor:    0,
-		Request:       req,
-		Body:          ioutil.NopCloser(bytes.NewBufferString(msg)),
-		ContentLength: int64(len(msg)),
-	}
-	sc.Write(req, resp)
+func fail(w http.ResponseWriter, code int) {
+	msg := []byte(http.StatusText(code) + "\n")
+	w.Header().Set("Content-Length", strconv.Itoa(len(msg)))
+	w.WriteHeader(code)
+	w.Write(msg)
 }
 
-func (s *HTTPListener) handle(conn net.Conn, isTLS bool) {
-	defer conn.Close()
-
-	var r *httpRoute
-
-	// For TLS, use the SNI hello to determine the domain.
-	// At this stage, if we don't find a match, we simply
-	// close the connection down.
-	if isTLS {
-		// Parse out host via SNI first
-		vhostConn, err := vhost.TLS(conn)
-		if err != nil {
-			log.Println("Failed to decode TLS connection", err)
-			return
-		}
-		host := vhostConn.Host()
-
-		// Find a backend for the key
-		r = s.findRouteForHost(host)
-		if r == nil {
-			return
-		}
-		if r.keypair == nil {
-			log.Println("Cannot serve TLS, no certificate defined for this domain")
-			return
-		}
-
-		// Init a TLS decryptor
-		tlscfg := &tls.Config{Certificates: []tls.Certificate{*r.keypair}}
-		conn = tls.Server(vhostConn, tlscfg)
+func (s *HTTPListener) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	ctx := context.Background()
+	ctx = ctxhelper.NewContextStartTime(ctx, time.Now())
+	host := req.Host
+	// fwdProtoHandler pushes the "real" port onto the end of X-Forwarded-Port
+	ports := strings.Split(req.Header["X-Forwarded-Port"][0], ", ")
+	port, _ := strconv.Atoi(ports[len(ports)-1])
+	r := s.findRoute(host, port, req.URL.Path)
+	if r == nil {
+		fail(w, 404)
+		return
 	}
 
-	sc := httputil.NewServerConn(conn, nil)
-	for {
-		req, err := sc.Read()
-		if err != nil {
-			if err != io.EOF && err != httputil.ErrPersistEOF {
-				log.Println("client read err:", err)
-			}
-			return
-		}
-
-		if !isTLS {
-			r = s.findRouteForHost(req.Host)
-			if r == nil {
-				fail(sc, req, 404, "Not Found")
-				continue
-			}
-		}
-
-		req.RemoteAddr = conn.RemoteAddr().String()
-		if r.service.handle(req, sc, isTLS, r.Sticky) {
-			return
-		}
-	}
+	r.ServeHTTP(ctx, w, req)
 }
 
 // A domain served by a listener, associated TLS certs,
@@ -348,202 +551,144 @@ type httpRoute struct {
 	*router.HTTPRoute
 
 	keypair *tls.Certificate
-	service *httpService
+	service *service
+	rp      *proxy.ReverseProxy
 }
 
 // A service definition: name, and set of backends.
-type httpService struct {
-	name string
-	ss   discoverd.ServiceSet
-	refs int
-
-	cookieKey *[32]byte
+type service struct {
+	name   string
+	sc     *cache.ServiceCache
+	refs   int
+	wm     *WatchManager
+	stream stream.Stream
+	reqs   map[string]int64
+	cond   *sync.Cond
 }
 
-func (s *httpService) getBackend() *httputil.ClientConn {
-	backend, _ := s.connectBackend()
-	return backend
+func newService(name string, sc *cache.ServiceCache, wm *WatchManager, trackBackends bool) *service {
+	s := &service{
+		name: name,
+		sc:   sc,
+		wm:   wm,
+	}
+	if trackBackends {
+		events := make(chan *discoverd.Event)
+		s.stream = sc.Watch(events, true)
+		s.reqs = make(map[string]int64)
+		s.cond = sync.NewCond(&sync.Mutex{})
+		go s.watchBackends(events)
+	}
+	return s
 }
 
-func (s *httpService) connectBackend() (*httputil.ClientConn, string) {
-	for _, addr := range shuffle(s.ss.Addrs()) {
-		// TODO: set connection timeout
-		backend, err := net.Dial("tcp", addr)
-		if err != nil {
-			// TODO: log error
-			// TODO: limit number of backends tried
-			// TODO: temporarily quarantine failing backends
-			log.Println("backend error", err)
-			continue
+func (s *service) TrackRequestStart(backend string) {
+	if s.reqs == nil {
+		return
+	}
+	s.cond.L.Lock()
+	s.reqs[backend]++
+	s.cond.L.Unlock()
+}
+
+func (s *service) TrackRequestDone(backend string) {
+	if s.reqs == nil {
+		return
+	}
+	s.cond.L.Lock()
+	s.reqs[backend]--
+	if s.reqs[backend] == 0 {
+		s.cond.Broadcast()
+	}
+	s.cond.L.Unlock()
+}
+
+func (s *service) Close() {
+	if s.stream != nil {
+		s.stream.Close()
+	}
+	s.sc.Close()
+}
+
+func (s *service) watchBackends(events chan *discoverd.Event) {
+	for event := range events {
+		go s.handleBackendEvent(event)
+	}
+}
+
+func (s *service) handleBackendEvent(event *discoverd.Event) {
+	if event.Instance == nil {
+		return
+	}
+	backend := &router.Backend{
+		Service: s.name,
+		Addr:    event.Instance.Addr,
+		App:     event.Instance.Meta["FLYNN_APP_NAME"],
+		JobID:   event.Instance.Meta["FLYNN_JOB_ID"],
+	}
+	switch event.Kind {
+	case discoverd.EventKindUp:
+		s.wm.Send(&router.Event{
+			Event:   router.EventTypeBackendUp,
+			Backend: backend,
+		})
+	case discoverd.EventKindDown:
+		s.wm.Send(&router.Event{
+			Event:   router.EventTypeBackendDown,
+			Backend: backend,
+		})
+
+		// wait for in-flight requests to finish then send a
+		// drained event
+		s.cond.L.Lock()
+		for s.reqs[backend.Addr] > 0 {
+			s.cond.Wait()
 		}
-		return httputil.NewClientConn(backend, nil), addr
+		s.cond.L.Unlock()
+		s.wm.Send(&router.Event{
+			Event:   router.EventTypeBackendDrained,
+			Backend: backend,
+		})
 	}
-	// TODO: log no backends found error
-	return nil, ""
 }
 
-const stickyCookie = "_backend"
+func (r *httpRoute) ServeHTTP(ctx context.Context, w http.ResponseWriter, req *http.Request) {
+	start, _ := ctxhelper.StartTimeFromContext(ctx)
+	req.Header.Set("X-Request-Start", strconv.FormatInt(start.UnixNano()/int64(time.Millisecond), 10))
+	setRequestID(req)
 
-func (s *httpService) getNewBackendSticky() (*httputil.ClientConn, *http.Cookie) {
-	backend, addr := s.connectBackend()
-	if backend == nil {
-		return nil, nil
-	}
+	r.rp.ServeHTTP(ctx, w, req)
+}
 
-	var nonce [24]byte
-	_, err := io.ReadFull(rand.Reader, nonce[:])
+func mustPortFromAddr(addr string) string {
+	_, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		panic(err)
 	}
-	out := make([]byte, len(nonce), len(nonce)+len(addr)+secretbox.Overhead)
-	copy(out, nonce[:])
-	out = secretbox.Seal(out, []byte(addr), &nonce, s.cookieKey)
-
-	return backend, &http.Cookie{Name: stickyCookie, Value: base64.StdEncoding.EncodeToString(out), Path: "/"}
+	return port
 }
 
-func (s *httpService) getBackendSticky(req *http.Request) (*httputil.ClientConn, *http.Cookie) {
-	cookie, err := req.Cookie(stickyCookie)
-	if err != nil {
-		return s.getNewBackendSticky()
-	}
+var validRequestIDPattern = regexp.MustCompile("^[a-zA-Z0-9+/=-]+$")
 
-	data, err := base64.StdEncoding.DecodeString(cookie.Value)
-	if err != nil {
-		return s.getNewBackendSticky()
+func setRequestID(req *http.Request) {
+	clientHeader := req.Header.Get("X-Request-Id")
+	if clientHeader == "" || len(clientHeader) < 20 || len(clientHeader) > 200 || !validRequestIDPattern.MatchString(clientHeader) {
+		req.Header.Set("X-Request-Id", random.UUID())
 	}
-	var nonce [24]byte
-	if len(data) < len(nonce) {
-		return s.getNewBackendSticky()
-	}
-	copy(nonce[:], data)
-	res, ok := secretbox.Open(nil, data[len(nonce):], &nonce, s.cookieKey)
-	if !ok {
-		return s.getNewBackendSticky()
-	}
-
-	addr := string(res)
-	ok = false
-	for _, a := range s.ss.Addrs() {
-		if a == addr {
-			ok = true
-			break
-		}
-	}
-	if !ok {
-		return s.getNewBackendSticky()
-	}
-
-	backend, err := net.Dial("tcp", string(addr))
-	if err != nil {
-		return s.getNewBackendSticky()
-	}
-	return httputil.NewClientConn(backend, nil), nil
 }
 
-func (s *httpService) handle(req *http.Request, sc *httputil.ServerConn, tls, sticky bool) (done bool) {
-	req.Header.Set("X-Request-Start", strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond), 10))
-	req.Header.Set("X-Request-Id", random.UUID())
-
-	var backend *httputil.ClientConn
-	var stickyCookie *http.Cookie
-	if sticky {
-		backend, stickyCookie = s.getBackendSticky(req)
-	} else {
-		backend = s.getBackend()
-	}
-	if backend == nil {
-		log.Println("no backend found")
-		fail(sc, req, 503, "Service Unavailable")
-		return
-	}
-	defer backend.Close()
-
-	req.Proto = "HTTP/1.1"
-	req.ProtoMajor = 1
-	req.ProtoMinor = 1
-	delete(req.Header, "Te")
-	delete(req.Header, "Transfer-Encoding")
-
-	if clientIP, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
-		// If we aren't the first proxy retain prior
-		// X-Forwarded-For information as a comma+space
-		// separated list and fold multiple headers into one.
-		if prior, ok := req.Header["X-Forwarded-For"]; ok {
-			clientIP = strings.Join(prior, ", ") + ", " + clientIP
-		}
-		req.Header.Set("X-Forwarded-For", clientIP)
-	}
-	if tls {
-		req.Header.Set("X-Forwarded-Proto", "https")
-	} else {
-		req.Header.Set("X-Forwarded-Proto", "http")
-	}
-	// TODO: Set X-Forwarded-Port
-
-	// Pass the Request-URI verbatim without any modifications
-	req.URL.Opaque = strings.Split(strings.TrimPrefix(req.RequestURI, req.URL.Scheme+":"), "?")[0]
-
-	if err := backend.Write(req); err != nil {
-		log.Println("server write err:", err)
-		// TODO: return error to client here
-		return true
-	}
-	res, err := backend.Read(req)
-	if res != nil {
-		if stickyCookie != nil {
-			res.Header.Add("Set-Cookie", stickyCookie.String())
-		}
-		if res.StatusCode == http.StatusSwitchingProtocols {
-			res.Body = nil
-		}
-		if err := sc.Write(req, res); err != nil {
-			if err != io.EOF && err != httputil.ErrPersistEOF {
-				log.Println("client write err:", err)
-				// TODO: log error
+func backendFunc(service string, f func() []*discoverd.Instance) proxy.BackendListFunc {
+	return func() []*router.Backend {
+		instances := f()
+		backends := make([]*router.Backend, len(instances))
+		for i, inst := range instances {
+			backends[i] = &router.Backend{
+				Service: service,
+				Addr:    inst.Addr,
+				App:     inst.Meta["FLYNN_APP_NAME"],
+				JobID:   inst.Meta["FLYNN_JOB_ID"],
 			}
-			return true
 		}
+		return backends
 	}
-	if err != nil {
-		if err != io.EOF && err != httputil.ErrPersistEOF {
-			log.Println("server read err:", err)
-			// TODO: log error
-			fail(sc, req, 502, "Bad Gateway")
-		}
-		return
-	}
-
-	// TODO: Proxy HTTP CONNECT? (example: Go RPC over HTTP)
-	if res.StatusCode == http.StatusSwitchingProtocols {
-		serverW, serverR := backend.Hijack()
-		clientW, clientR := sc.Hijack()
-		defer serverW.Close()
-		done := make(chan struct{})
-		go func() {
-			serverR.WriteTo(clientW)
-			if cw, ok := clientW.(writeCloser); ok {
-				cw.CloseWrite()
-			}
-			close(done)
-		}()
-		clientR.WriteTo(serverW)
-		serverW.(writeCloser).CloseWrite()
-		<-done
-		return true
-	}
-
-	return
-}
-
-type writeCloser interface {
-	CloseWrite() error
-}
-
-func shuffle(s []string) []string {
-	for i := len(s) - 1; i > 0; i-- {
-		j := random.Math.Intn(i + 1)
-		s[i], s[j] = s[j], s[i]
-	}
-	return s
 }

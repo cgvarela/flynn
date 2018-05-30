@@ -1,22 +1,24 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"sort"
 	"text/tabwriter"
+	"text/template"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/docker/docker/pkg/units"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
+	"github.com/docker/go-units"
 	"github.com/flynn/flynn/host/types"
 	"github.com/flynn/flynn/pkg/cluster"
+	"github.com/flynn/go-docopt"
 )
 
 func init() {
 	Register("ps", runPs, `
-usage: flynn-host ps [-a|--all] [-q|--quiet]
+usage: flynn-host ps [-a|--all] [-q|--quiet] [-f <format>]
 
 List jobs`)
 }
@@ -24,7 +26,7 @@ List jobs`)
 type sortJobs []host.ActiveJob
 
 func (s sortJobs) Len() int           { return len(s) }
-func (s sortJobs) Less(i, j int) bool { return s[i].StartedAt.Sub(s[j].StartedAt) < 0 }
+func (s sortJobs) Less(i, j int) bool { return s[i].CreatedAt.Sub(s[j].CreatedAt) < 0 }
 func (s sortJobs) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
 func runPs(args *docopt.Args, client *cluster.Client) error {
@@ -34,7 +36,19 @@ func runPs(args *docopt.Args, client *cluster.Client) error {
 	}
 	if args.Bool["-q"] || args.Bool["--quiet"] {
 		for _, job := range jobs {
-			fmt.Println(clusterJobID(job))
+			if format := args.String["<format>"]; format != "" {
+				tmpl, err := template.New("format").Funcs(template.FuncMap{
+					"metadata": func(key string) string { return job.Job.Metadata[key] },
+				}).Parse(format + "\n")
+				if err != nil {
+					return err
+				}
+				if err := tmpl.Execute(os.Stdout, job); err != nil {
+					return err
+				}
+				continue
+			}
+			fmt.Println(job.Job.ID)
 		}
 		return nil
 	}
@@ -43,20 +57,19 @@ func runPs(args *docopt.Args, client *cluster.Client) error {
 }
 
 func jobList(client *cluster.Client, all bool) (sortJobs, error) {
-	hosts, err := client.ListHosts()
+	hosts, err := client.Hosts()
 	if err != nil {
 		return nil, fmt.Errorf("could not list hosts: %s", err)
 	}
+	if len(hosts) == 0 {
+		return nil, errors.New("no hosts found")
+	}
 
 	var jobs []host.ActiveJob
-	for id := range hosts {
-		h, err := client.DialHost(id)
-		if err != nil {
-			return nil, fmt.Errorf("could not dial host %s: %s", id, err)
-		}
+	for _, h := range hosts {
 		hostJobs, err := h.ListJobs()
 		if err != nil {
-			return nil, fmt.Errorf("could not get jobs for host %s: %s", id, err)
+			return nil, fmt.Errorf("could not get jobs for host %s: %s", h.ID(), err)
 		}
 		for _, job := range hostJobs {
 			jobs = append(jobs, job)
@@ -80,21 +93,29 @@ func printJobs(jobs sortJobs, out io.Writer) {
 	listRec(w,
 		"ID",
 		"STATE",
-		"STARTED",
+		"CREATED",
 		"CONTROLLER APP",
 		"CONTROLLER TYPE",
+		"ERROR",
 	)
+
 	for _, job := range jobs {
+		var created string
+		if !job.CreatedAt.IsZero() {
+			created = units.HumanDuration(time.Now().UTC().Sub(job.CreatedAt)) + " ago"
+		}
+		var jobError string
+		if job.Error != nil {
+			jobError = *job.Error
+		}
+
 		listRec(w,
-			clusterJobID(job),
+			job.Job.ID,
 			job.Status,
-			units.HumanDuration(time.Now().UTC().Sub(job.StartedAt))+" ago",
+			created,
 			job.Job.Metadata["flynn-controller.app_name"],
 			job.Job.Metadata["flynn-controller.type"],
+			jobError,
 		)
 	}
-}
-
-func clusterJobID(job host.ActiveJob) string {
-	return job.HostID + "-" + job.Job.ID
 }

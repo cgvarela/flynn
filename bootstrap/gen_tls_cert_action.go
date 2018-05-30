@@ -1,48 +1,56 @@
-// Copyright 2009 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
 package bootstrap
 
 import (
-	"fmt"
-	"time"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/pem"
 
-	"github.com/flynn/flynn/pkg/certgen"
+	"github.com/flynn/flynn/pkg/tlscert"
 )
 
 type GenTLSCertAction struct {
 	ID    string   `json:"id"`
 	Hosts []string `json:"hosts"`
+
+	CACert     string `json:"ca_cert"`
+	Cert       string `json:"cert"`
+	PrivateKey string `json:"key"`
 }
 
 func init() {
 	Register("gen-tls-cert", &GenTLSCertAction{})
 }
 
-type TLSCert struct {
-	Cert string `json:"cert"`
-	Pin  string `json:"pin"`
-
-	PrivateKey string `json:"-"`
-}
-
-func (c *TLSCert) String() string {
-	return fmt.Sprintf("pin: %s", c.Pin)
-}
-
 func (a *GenTLSCertAction) Run(s *State) (err error) {
-	data := &TLSCert{}
+	data := &tlscert.Cert{}
 	s.StepData[a.ID] = data
-	data.Cert, data.PrivateKey, data.Pin, err = a.generateCert(s)
-	return
-}
 
-func (a *GenTLSCertAction) generateCert(s *State) (cert, privKey, pin string, err error) {
-	certOptions := certgen.Certificate{
-		Lifespan: 365 * 24 * time.Hour,
-		Hosts:    a.Hosts,
+	a.CACert = interpolate(s, a.CACert)
+	a.Cert = interpolate(s, a.Cert)
+	a.PrivateKey = interpolate(s, a.PrivateKey)
+	if a.CACert != "" && a.Cert != "" && a.PrivateKey != "" {
+		data.CACert = a.CACert
+		data.Cert = a.Cert
+		data.PrivateKey = a.PrivateKey
+
+		// calculate cert pin
+		b, _ := pem.Decode([]byte(data.Cert))
+		sha := sha256.Sum256(b.Bytes)
+		data.Pin = base64.StdEncoding.EncodeToString(sha[:])
+		return nil
 	}
-	cert, privKey, pin, err = certgen.Generate(certOptions)
-	return
+
+	for i, h := range a.Hosts {
+		a.Hosts[i] = interpolate(s, h)
+	}
+	c, err := tlscert.Generate(a.Hosts)
+	if err != nil {
+		return err
+	}
+	data.CACert = c.CACert
+	data.Cert = c.Cert
+	data.Pin = c.Pin
+	data.PrivateKey = c.PrivateKey
+
+	return err
 }

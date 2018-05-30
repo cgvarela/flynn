@@ -3,15 +3,16 @@ package main
 import (
 	"errors"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-sql"
 	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/flynn/pkg/postgres"
+	"github.com/jackc/pgx"
 )
 
 type ProviderRepo struct {
-	db *DB
+	db *postgres.DB
 }
 
-func NewProviderRepo(db *DB) *ProviderRepo {
+func NewProviderRepo(db *postgres.DB) *ProviderRepo {
 	return &ProviderRepo{db}
 }
 
@@ -21,37 +22,49 @@ func (r *ProviderRepo) Add(data interface{}) error {
 		return errors.New("controller: name must not be blank")
 	}
 	if p.URL == "" {
-		return errors.New("controler: url must not be blank")
+		return errors.New("controller: url must not be blank")
 	}
 	// TODO: validate url
-	err := r.db.QueryRow("INSERT INTO providers (name, url) VALUES ($1, $2) RETURNING provider_id, created_at, updated_at", p.Name, p.URL).Scan(&p.ID, &p.CreatedAt, &p.UpdatedAt)
-	p.ID = cleanUUID(p.ID)
-	return err
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	err = tx.QueryRow("provider_insert", p.Name, p.URL).Scan(&p.ID, &p.CreatedAt, &p.UpdatedAt)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	if err := createEvent(tx.Exec, &ct.Event{
+		ObjectID:   p.ID,
+		ObjectType: ct.EventTypeProvider,
+	}, p); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
-func scanProvider(s Scanner) (*ct.Provider, error) {
+func scanProvider(s postgres.Scanner) (*ct.Provider, error) {
 	p := &ct.Provider{}
 	err := s.Scan(&p.ID, &p.Name, &p.URL, &p.CreatedAt, &p.UpdatedAt)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		err = ErrNotFound
 	}
-	p.ID = cleanUUID(p.ID)
 	return p, err
 }
 
 func (r *ProviderRepo) Get(id string) (interface{}, error) {
-	var row Scanner
-	query := "SELECT provider_id, name, url, created_at, updated_at FROM providers WHERE deleted_at IS NULL AND "
+	var row postgres.Scanner
 	if idPattern.MatchString(id) {
-		row = r.db.QueryRow(query+"(provider_id = $1 OR name = $2) LIMIT 1", id, id)
+		row = r.db.QueryRow("provider_select_by_name_or_id", id, id)
 	} else {
-		row = r.db.QueryRow(query+"name = $1", id)
+		row = r.db.QueryRow("provider_select_by_name", id)
 	}
 	return scanProvider(row)
 }
 
 func (r *ProviderRepo) List() (interface{}, error) {
-	rows, err := r.db.Query("SELECT provider_id, name, url, created_at, updated_at FROM providers WHERE deleted_at IS NULL ORDER BY created_at DESC")
+	rows, err := r.db.Query("provider_list")
 	if err != nil {
 		return nil, err
 	}

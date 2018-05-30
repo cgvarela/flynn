@@ -1,27 +1,20 @@
-/** @jsx React.DOM */
-//= require ./app-processes
-//= require ./app-resources
-//= require ./app-routes
-//= require ./route-link
+import AppProcesses from './app-processes';
+import AppResources from './app-resources';
+import AppRoutes from './app-routes';
+import RouteLink from './route-link';
 
-(function () {
-
-"use strict";
-
-var RouteLink = Dashboard.Views.RouteLink;
-
-Dashboard.Views.AppControls = React.createClass({
+var AppControls = React.createClass({
 	displayName: "Views.AppControls",
 
 	render: function () {
 		var app = this.props.app;
 		var formation = this.props.formation;
 		var getAppPath = this.props.getAppPath;
-		var headerComponent = this.props.headerComponent || React.DOM.header;
+		var headerComponent = this.props.headerComponent || "header";
 
 		return (
 			<section className="app-controls">
-				{headerComponent(this.props,
+				{React.createElement(headerComponent, this.props,
 					<h1>
 						{app.name}
 						<RouteLink path={getAppPath("/delete")}>
@@ -30,37 +23,36 @@ Dashboard.Views.AppControls = React.createClass({
 					</h1>
 				)}
 
-				<section className="flex-row">
-					<section className="col">
-						<RouteLink path={getAppPath("/env")} className="btn-green">
-							App environment
-						</RouteLink>
+				<section>
+					<RouteLink path={getAppPath("/env")} className="btn-green">
+						App environment
+					</RouteLink>
 
-						{formation ? (
-							<Dashboard.Views.AppProcesses appId={this.props.appId} formation={formation} />
-						) : (
-							<section className="app-processes">
-								&nbsp;
-							</section>
-						)}
+					{formation ? (
+						<AppProcesses appId={this.props.appId} formation={formation} />
+					) : (
+						<section className="app-processes">
+							&nbsp;
+						</section>
+					)}
 
-						<RouteLink path={getAppPath("/logs")} className="logs-btn">
-							Show logs
-						</RouteLink>
-					</section>
+					<RouteLink path={getAppPath("/logs")} className="logs-btn">
+						Show logs
+					</RouteLink>
+				</section>
 
-					<section className="col">
-						<Dashboard.Views.AppResources
-							appId={this.props.appId} />
+				<section>
+					<AppResources
+						appId={this.props.appId}
+						getAppPath={this.props.getAppPath} />
 
-						<Dashboard.Views.AppRoutes
-							appId={this.props.appId}
-							getAppPath={this.props.getAppPath} />
-					</section>
+					<AppRoutes
+						appId={this.props.appId}
+						getAppPath={this.props.getAppPath} />
 				</section>
 			</section>
 		);
 	}
 });
 
-})();
+export default AppControls;

@@ -1,6 +1,3 @@
-(function () {
-"use strict";
-
 var findScrollParent = function (el) {
 	var ref = el;
 	while (ref) {
@@ -15,7 +12,7 @@ var findScrollParent = function (el) {
 	return window;
 };
 
-var ScrollPagination = window.ScrollPagination = React.createClass({
+var ScrollPagination = React.createClass({
 	displayName: "ScrollPagination",
 
 	getDefaultProps: function () {
@@ -30,6 +27,7 @@ var ScrollPagination = window.ScrollPagination = React.createClass({
 	componentWillMount: function () {
 		this.__pages = {};
 		this.__pageIds = [];
+		this.props.manager.registerPageEventHandler(this.handlePageEvent);
 	},
 
 	componentDidMount: function () {
@@ -63,7 +61,7 @@ var ScrollPagination = window.ScrollPagination = React.createClass({
 		if (this.__paddingTop) {
 			style.paddingTop = this.__paddingTop + "px";
 		}
-		return React.DOM.div({
+		return React.createElement('div', {
 			style: style,
 			ref: "wrapper"
 		}, this.props.children);
@@ -78,16 +76,6 @@ var ScrollPagination = window.ScrollPagination = React.createClass({
 					id: pageId,
 					height: event.height
 				};
-			break;
-
-			case "update":
-				pages[pageId] = {
-					id: pageId,
-					height: event.height
-				};
-			break;
-
-			case "unmount":
 			break;
 		}
 		this.__pages = pages;
@@ -145,9 +133,9 @@ var ScrollPagination = window.ScrollPagination = React.createClass({
 				if (child === null) {
 					return;
 				}
-				if (child.constructor.displayName === "ScrollPagination.Page") {
+				if (child.type.displayName === "ScrollPagination.Page") {
 					pageIds.push(child.props.id);
-				} else if (child.constructor.displayName === "ul") {
+				} else if (child.type === "ul") {
 					findPages(child.props.children);
 				}
 			});
@@ -186,7 +174,9 @@ var ScrollPagination = window.ScrollPagination = React.createClass({
 			var height = pages[pageId].height;
 			offset += height;
 		});
-		this.__setScrollY(this.__getScrollY() + offset);
+		if (this.props.showNewItemsTop !== true || this.__scrollY !== 0) {
+			this.__setScrollY(this.__getScrollY() + offset);
+		}
 	},
 
 	__updateDimensions: function () {
@@ -243,7 +233,7 @@ var ScrollPagination = window.ScrollPagination = React.createClass({
 		var viewportHeight = this.__dimentions.viewportHeight;
 		var contentHeight = this.__dimentions.contentHeight;
 		var offsetTop = this.__dimentions.offsetTop;
-		var scrollY = this.__getScrollY();
+		var scrollY = this.__scrollY = this.__getScrollY();
 
 		var remainingScrollBottom = contentHeight - scrollY - viewportHeight + offsetTop;
 		var remainingScrollTop = contentHeight - remainingScrollBottom - viewportHeight;
@@ -278,7 +268,7 @@ ScrollPagination.Page = React.createClass({
 
 	getDefaultProps: function () {
 		return {
-			component: React.DOM.div
+			component: 'div'
 		};
 	},
 
@@ -299,16 +289,36 @@ ScrollPagination.Page = React.createClass({
 				props[k] = this.props[k];
 			}
 		}
-		return this.props.component(props, this.props.children);
+		return React.createElement(this.props.component, props, this.props.children);
 	},
 
 	__determineHeight: function () {
 		var height = this.__height = this.getDOMNode().offsetHeight;
-		this.props.onPageEvent(this.props.id, {
+		this.props.manager.dispatchPageEvent(this.props.id, {
 			name: "mount",
 			height: height
 		});
 	}
 });
 
-})();
+var Manager = function () {
+	this.pendingEvents = [];
+	this.pageEventHandler = null;
+};
+Manager.prototype.registerPageEventHandler = function (callback) {
+	this.pageEventHandler = callback;
+	this.pendingEvents.forEach(function (args) {
+		this.dispatchPageEvent.apply(this, args);
+	}.bind(this));
+	this.pendingEvents = [];
+};
+Manager.prototype.dispatchPageEvent = function (pageId, event) {
+	if (this.pageEventHandler === null) {
+		this.pendingEvents.push([pageId, event]);
+		return;
+	}
+	this.pageEventHandler(pageId, event);
+};
+ScrollPagination.Manager = Manager;
+
+export default ScrollPagination;

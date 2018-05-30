@@ -1,98 +1,34 @@
-/** @jsx React.DOM */
-//= require ./route-link
-//= require ./external-link
+import { pathWithParams } from 'marbles/history';
+import { assertEqual } from 'marbles/utils';
+import AppStore from '../stores/app';
+import RouteLink from './route-link';
 
-(function () {
+var isSystemApp = AppStore.isSystemApp;
 
-"use strict";
-
-var RouteLink = Dashboard.Views.RouteLink;
-var ExternalLink = Dashboard.Views.ExternalLink;
-
-function getState(props) {
-	var state = {};
-
-	var groups = {};
-	var services = [];
-	props.apps.forEach(function (app) {
-		var repoFullName;
-		if (app.meta && app.meta.type === "github") {
-			repoFullName = app.meta.user_login +"/"+ app.meta.repo_name;
-			groups[repoFullName] = groups[repoFullName] || [];
-			groups[repoFullName].push(app);
-		} else {
-			services.push(app);
-		}
-	});
-	state.groups = groups;
-	state.services = services;
-
-	return state;
-}
-
-Dashboard.Views.AppsList = React.createClass({
+var AppsList = React.createClass({
 	displayName: "Views.AppsList",
 
 	render: function () {
-		var groups = this.state.groups;
-		var services = this.state.services;
+		var apps = this.state.apps;
 
 		var getAppPath = this.props.getAppPath;
-		var clusterDomain = this.props.clusterDomain;
+		var selectedAppId = this.props.selectedAppId;
 
 		return (
-			<ul className="apps-list">
-				{Object.keys(groups).sort().map(function (key) {
-					var apps = groups[key];
+			<ul className="items-list">
+				{apps.map(function (app) {
+					var classes = [];
+					if (assertEqual(app.id, selectedAppId)) {
+						classes.push("selected");
+					}
+					if (assertEqual(app.meta["flynn-system-app"], "true")) {
+						classes.push("system-application");
+					}
 					return (
-						<li key={key} className="repo">
-							<span className="name">{key}</span>
-
-							<ul>
-								{apps.map(function (app) {
-									return (
-										<li key={app.id}>
-											<span className="name">
-												{app.meta.ref}
-												{app.protected ? null : (
-													<ExternalLink href={"http://"+ app.name +"."+ clusterDomain}>link</ExternalLink>
-												)}
-											</span>
-											<ul className="actions">
-												<li>
-													<RouteLink
-														className="icn-edit"
-														path={getAppPath(app.id)}/>
-												</li>
-											</ul>
-										</li>
-									);
-								}.bind(this))}
-							</ul>
-						</li>
-					);
-				}.bind(this))}
-
-				{services.map(function (app) {
-					return (
-						<li key={app.id} className={"service"+ (app.protected ? " protected" : "")}>
-							<span className="name">
+						<li key={app.id} className={ classes.join(" ") }>
+							<RouteLink path={getAppPath(app.id)}>
 								{app.name}
-								{app.protected ? null : (
-									<ExternalLink href={"http://"+ app.name +"."+ clusterDomain}>link</ExternalLink>
-								)}
-							</span>
-							<ul className="actions">
-								<li>
-									{app.protected ? (
-										<span className="icn-edit" />
-									) : (
-										<RouteLink
-											className="icn-edit"
-											path={getAppPath(app.id)}/>
-									)}
-								</li>
-							</ul>
+							</RouteLink>
 						</li>
 					);
 				}.bind(this))}
@@ -104,18 +40,29 @@ Dashboard.Views.AppsList = React.createClass({
 		return {
 			apps: [],
 			getAppPath: function (appId) {
-				return Marbles.history.pathWithParams("/apps/:id", [{ id: appId }]);
+				return pathWithParams("/apps/:id", [{ id: appId }]);
 			}
 		};
 	},
 
 	componentWillMount: function () {
-		this.setState(getState(this.props));
+		this.setState(this.__getState(this.props));
 	},
 
 	componentWillReceiveProps: function (props) {
-		this.setState(getState(props));
+		this.setState(this.__getState(props));
+	},
+
+	__getState: function (props) {
+		var state = {};
+
+		var showSystemApps = props.showSystemApps;
+		state.apps = props.apps.filter(function (app) {
+			return !isSystemApp(app) || showSystemApps;
+		});
+
+		return state;
 	}
 });
 
-})();
+export default AppsList;

@@ -1,20 +1,8 @@
-/** @jsx React.DOM */
-//= require ../stores/github-commits
-//= require ../actions/github-commits
-//= require ./helpers/findScrollParent
-//= require ./external-link
-//= require ./timestamp
-//= require ./github-commit
-//= require ScrollPagination
-
-(function () {
-
-"use strict";
-
-var GithubCommitsStore = Dashboard.Stores.GithubCommits;
-var GithubCommitsActions = Dashboard.Actions.GithubCommits;
-
-var ScrollPagination = window.ScrollPagination;
+import { assertEqual } from 'marbles/utils';
+import ScrollPagination from 'ScrollPagination';
+import GithubCommitsStore from '../stores/github-commits';
+import GithubCommitsActions from '../actions/github-commits';
+import GithubCommit from './github-commit';
 
 function getCommitsStoreId (props) {
 	var id = {
@@ -53,12 +41,11 @@ function getState (props, prevState) {
 	return state;
 }
 
-Dashboard.Views.GithubCommitSelector = React.createClass({
+var GithubCommitSelector = React.createClass({
 	displayName: "Views.GithubCommitSelector",
 
 	render: function () {
-		var handlePageEvent = this.__handlePageEvent;
-		var Commit = this.props.commitComponent || Dashboard.Views.GithubCommit;
+		var Commit = this.props.commitComponent || GithubCommit;
 
 		var deployedSha = this.props.deployedSha;
 		var selectedSha = this.props.selectedSha;
@@ -67,7 +54,7 @@ Dashboard.Views.GithubCommitSelector = React.createClass({
 		return (
 			<section className="github-commits">
 				<ScrollPagination
-					ref="scrollPagination"
+					manager={this.props.scrollPaginationManager}
 					hasPrevPage={this.state.commitsHasPrevPage}
 					hasNextPage={this.state.commitsHasNextPage}
 					unloadPage={GithubCommitsActions.unloadPageId.bind(null, this.state.commitsStoreId)}
@@ -82,9 +69,9 @@ Dashboard.Views.GithubCommitSelector = React.createClass({
 						return (
 							<ScrollPagination.Page
 								key={page.id}
+								manager={this.props.scrollPaginationManager}
 								id={page.id}
-								onPageEvent={handlePageEvent}
-								component={React.DOM.ul}>
+								component='ul'>
 
 								{page.commits.map(function (commit) {
 									return (
@@ -105,6 +92,12 @@ Dashboard.Views.GithubCommitSelector = React.createClass({
 				</ScrollPagination>
 			</section>
 		);
+	},
+
+	getDefaultProps: function () {
+		return {
+			scrollPaginationManager: new ScrollPagination.Manager()
+		};
 	},
 
 	getInitialState: function () {
@@ -128,7 +121,7 @@ Dashboard.Views.GithubCommitSelector = React.createClass({
 	componentWillReceiveProps: function (props) {
 		var oldCommitsStoreId = this.state.commitsStoreId;
 		var newCommitsStoreId = getCommitsStoreId(props);
-		if ( !Marbles.Utils.assertEqual(oldCommitsStoreId, newCommitsStoreId) ) {
+		if ( !assertEqual(oldCommitsStoreId, newCommitsStoreId) ) {
 			GithubCommitsStore.removeChangeListener(oldCommitsStoreId, this.__handleStoreChange);
 			GithubCommitsStore.addChangeListener(newCommitsStoreId, this.__handleStoreChange);
 			this.__handleStoreChange(props);
@@ -143,13 +136,9 @@ Dashboard.Views.GithubCommitSelector = React.createClass({
 		this.setState(getState(props || this.props, this.state));
 	},
 
-	__handlePageEvent: function (pageId, event) {
-		this.refs.scrollPagination.handlePageEvent(pageId, event);
-	},
-
 	__handleCommitSelected: function (commit) {
 		GithubCommitsActions.commitSelected(this.state.commitsStoreId, commit.sha);
 	}
 });
 
-})();
+export default GithubCommitSelector;

@@ -1,10 +1,9 @@
-//= require ../store
+import { extend } from 'marbles/utils';
+import Store from '../store';
+import Config from '../config';
+import JobsStream from './jobs-stream';
 
-(function () {
-
-"use strict";
-
-var JobOutput = Dashboard.Stores.JobOutput = Dashboard.Store.createClass({
+var JobOutput = Store.createClass({
 	displayName: "Stores.JobOutput",
 
 	getState: function () {
@@ -14,13 +13,15 @@ var JobOutput = Dashboard.Stores.JobOutput = Dashboard.Store.createClass({
 	willInitialize: function () {
 		this.props = {
 			appId: this.id.appId,
-			jobId: this.id.jobId
+			jobId: this.id.jobId,
+			lines: this.id.lines || 0
 		};
-		this.url = Dashboard.config.endpoints.cluster_controller + "/apps/"+ this.props.appId +"/jobs/"+ this.props.jobId +"/log?tail=true&key="+ encodeURIComponent(Dashboard.config.user.controller_key);
+		this.url = Config.endpoints.cluster_controller +"/apps/"+ this.props.appId +"/log?job_id="+ this.props.jobId +"&follow=true&lines="+ this.props.lines +"&key="+ encodeURIComponent(Config.user.controller_key);
 	},
 
 	didBecomeActive: function () {
 		this.__openEventStream();
+		this.__watchAppJobs();
 	},
 
 	didBecomeInactive: function () {
@@ -30,6 +31,7 @@ var JobOutput = Dashboard.Stores.JobOutput = Dashboard.Store.createClass({
 				this.setState({
 					open: false
 				});
+				this.__unwatchAppJobs();
 			}
 		}.bind(this));
 	},
@@ -43,21 +45,18 @@ var JobOutput = Dashboard.Stores.JobOutput = Dashboard.Store.createClass({
 		};
 	},
 
-	handleEvent: function () {
-	},
-
 	__openEventStream: function (retryCount) {
 		if ( !window.hasOwnProperty('EventSource') ) {
 			return;
 		}
 
-		this.setState(Marbles.Utils.extend(this.getInitialState(), {open: true}));
+		this.setState(extend(this.getInitialState(), {open: true}));
 
 		var url = this.url;
 		var eventSource;
 		var open = false;
 		eventSource = new window.EventSource(url, {withCredentials: true});
-		eventSource.addEventListener("error", function () {
+		var handleError = function () {
 			eventSource.close();
 			if ( !open && (!retryCount || retryCount < 3) ) {
 				setTimeout(function () {
@@ -70,48 +69,45 @@ var JobOutput = Dashboard.Stores.JobOutput = Dashboard.Store.createClass({
 					streamError: "Failed to connect to log"
 				});
 			}
-		}.bind(this), false);
+		}.bind(this);
+		eventSource.addEventListener("error", handleError, false);
 		eventSource.addEventListener("open", function () {
 			open = true;
 		});
 		eventSource.addEventListener("message", function (e) {
-			this.setState({
-				output: this.state.output.concat(JSON.parse(e.data))
-			});
-		}.bind(this), false);
-		eventSource.addEventListener("eof", function () {
-			this.setState({
-				open: false,
-				eof: true
-			});
-			eventSource.close();
-		}.bind(this), false);
-		eventSource.addEventListener("exit", function (e) {
-			var data = JSON.parse(e.data);
-			if (data.status === 0) {
-				this.setState({
-					open: false,
-					eof: true
-				});
-			} else {
-				this.setState({
-					open: false,
-					eof: false,
-					streamError: "Non-zero exit status: "+ data.status
+			var evnt = JSON.parse(e.data || "");
+			switch (evnt.event) {
+			case "error":
+				handleError();
+				return;
+			}
+			var data = evnt.data;
+			if (data.msg && data.timestamp) {
+				this.setStateWithDelay({
+					output: this.state.output.concat([evnt.data])
 				});
 			}
-			eventSource.close();
 		}.bind(this), false);
 
 		this.__eventSource = eventSource;
-	}
+	},
 
-}, Marbles.State);
+	__watchAppJobs: function () {
+		JobsStream.addChangeListener({ appId: this.props.appId }, this.__handleJobsStreamChange);
+	},
+
+	__unwatchAppJobs: function () {
+		JobsStream.removeChangeListener({ appId: this.props.appId }, this.__handleJobsStreamChange);
+	},
+
+	// We don't care about change events, but have a listener setup to ensure the
+	// jobs stream is open (i.e. so we can get the JOB_STATE_CHANGE event from it)
+	__handleJobsStreamChange: function () {}
+
+});
 
 JobOutput.isValidId = function (id) {
 	return id.appId && id.jobId;
 };
 
-JobOutput.registerWithDispatcher(Dashboard.Dispatcher);
-
-})();
+export default JobOutput;

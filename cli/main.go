@@ -1,22 +1,23 @@
 package main
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"text/tabwriter"
+	"time"
 	"unicode"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
+	"github.com/docker/go-units"
 	cfg "github.com/flynn/flynn/cli/config"
 	"github.com/flynn/flynn/controller/client"
+	"github.com/flynn/flynn/pkg/shutdown"
+	"github.com/flynn/flynn/pkg/version"
+	"github.com/flynn/go-docopt"
 )
 
 var (
@@ -25,37 +26,52 @@ var (
 )
 
 func main() {
+	defer shutdown.Exit()
+
 	log.SetFlags(0)
 
 	usage := `
-usage: flynn [-a <app>] <command> [<args>...]
+usage: flynn [-a <app>] [-c <cluster>] <command> [<args>...]
 
 Options:
 	-a <app>
+	-c <cluster>
 	-h, --help
 
 Commands:
-	help      show usage for a specific command
-	cluster   manage clusters
-	create    create an app
-	delete    delete an app
-	apps      list apps
-	ps        list jobs
-	kill      kill a job
-	log       get job log
-	scale     change formation
-	run       run a job
-	env       manage env variables
-	route     manage routes
-	provider  manage resource providers
-	resource  provision a new resource
-	key       manage SSH public keys
-	release   add a docker image release
-	version   show flynn version
+	help        show usage for a specific command
+	cluster     manage clusters
+	create      create an app
+	delete      delete an app
+	apps        list apps
+	info        show app information
+	ps          list jobs
+	kill        kill jobs
+	log         get app log
+	scale       change formation
+	run         run a job
+	env         manage env variables
+	limit       manage resource limits
+	meta        manage app metadata
+	route       manage routes
+	pg          manage postgres database
+	mysql       manage mysql database
+	mongodb     manage mongodb database
+	redis       manage redis database
+	provider    manage resource providers
+	docker      deploy Docker images to a Flynn cluster
+	remote      manage git remotes
+	resource    provision a new resource
+	release     manage app releases
+	deployment  list deployments
+	volume      manage volumes
+	export      export app data
+	import      create app from exported data
+	version     show flynn version
 
 See 'flynn help <command>' for more information on a specific command.
 `[1:]
-	args, _ := docopt.Parse(usage, nil, true, Version, true)
+	args, _ := docopt.Parse(usage, nil, true, version.String(), true)
 
 	cmd := args.String["<command>"]
 	cmdArgs := args.All["<args>"].([]string)
@@ -71,7 +87,7 @@ See 'flynn help <command>' for more information on a specific command.
 			}
 			out, err := json.MarshalIndent(cmds, "", "\t")
 			if err != nil {
-				log.Fatal(err)
+				shutdown.Fatal(err)
 			}
 			fmt.Println(string(out))
 			return
@@ -84,16 +100,23 @@ See 'flynn help <command>' for more information on a specific command.
 	// Run the update command as early as possible to avoid the possibility of
 	// installations being stranded without updates due to errors in other code
 	if cmd == "update" {
-		runUpdate(cmdArgs)
+		if err := runUpdate(); err != nil {
+			shutdown.Fatal(err)
+		}
 		return
-	} else if updater != nil {
+	} else {
 		defer updater.backgroundRun() // doesn't run if os.Exit is called
+	}
+
+	// Set the cluster config name
+	if args.String["-c"] != "" {
+		flagCluster = args.String["-c"]
 	}
 
 	flagApp = args.String["-a"]
 	if flagApp != "" {
 		if err := readConfig(); err != nil {
-			log.Fatal(err)
+			shutdown.Fatal(err)
 		}
 
 		if ra, err := appFromGitRemote(flagApp); err == nil {
@@ -103,7 +126,8 @@ See 'flynn help <command>' for more information on a specific command.
 	}
 
 	if err := runCommand(cmd, cmdArgs); err != nil {
-		log.Fatal(err)
+		log.Println(err)
+		shutdown.ExitWithCode(1)
 		return
 	}
 }
@@ -118,7 +142,7 @@ var commands = make(map[string]*command)
 
 func register(cmd string, f interface{}, usage string) *command {
 	switch f.(type) {
-	case func(*docopt.Args, *controller.Client) error, func(*docopt.Args) error, func() error, func():
+	case func(*docopt.Args, controller.Client) error, func(*docopt.Args) error, func() error, func():
 	default:
 		panic(fmt.Sprintf("invalid command function %s '%T'", cmd, f))
 	}
@@ -142,24 +166,11 @@ func runCommand(name string, args []string) (err error) {
 	}
 
 	switch f := cmd.f.(type) {
-	case func(*docopt.Args, *controller.Client) error:
+	case func(*docopt.Args, controller.Client) error:
 		// create client and run command
-		var client *controller.Client
-		cluster, err := getCluster()
+		client, err := getClusterClient()
 		if err != nil {
-			log.Fatal(err)
-		}
-		if cluster.TLSPin != "" {
-			pin, err := base64.StdEncoding.DecodeString(cluster.TLSPin)
-			if err != nil {
-				log.Fatalln("error decoding tls pin:", err)
-			}
-			client, err = controller.NewClientWithPin(cluster.URL, cluster.Key, pin)
-		} else {
-			client, err = controller.NewClient(cluster.URL, cluster.Key)
-		}
-		if err != nil {
-			log.Fatal(err)
+			shutdown.Fatal(err)
 		}
 
 		return f(parsedArgs, client)
@@ -179,11 +190,7 @@ var config *cfg.Config
 var clusterConf *cfg.Cluster
 
 func configPath() string {
-	p := os.Getenv("FLYNNRC")
-	if p == "" {
-		p = filepath.Join(homedir(), ".flynnrc")
-	}
-	return p
+	return cfg.DefaultPath()
 }
 
 func readConfig() (err error) {
@@ -194,20 +201,26 @@ func readConfig() (err error) {
 	if os.IsNotExist(err) {
 		err = nil
 	}
+	if config.Upgrade() {
+		if err := config.SaveTo(configPath()); err != nil {
+			return fmt.Errorf("Error saving upgraded config: %s", err)
+		}
+	}
 	return
 }
 
-func homedir() string {
-	home := os.Getenv("HOME")
-	if home == "" && runtime.GOOS == "windows" {
-		return os.Getenv("%APPDATA%")
+func getClusterClient() (controller.Client, error) {
+	cluster, err := getCluster()
+	if err != nil {
+		return nil, err
 	}
-	return home
+	return cluster.Client()
 }
 
 var ErrNoClusters = errors.New("no clusters configured")
 
 func getCluster() (*cfg.Cluster, error) {
+	app() // try to look up and cache app/cluster from git remotes
 	if clusterConf != nil {
 		return clusterConf, nil
 	}
@@ -217,20 +230,24 @@ func getCluster() (*cfg.Cluster, error) {
 	if len(config.Clusters) == 0 {
 		return nil, ErrNoClusters
 	}
-	if flagCluster == "" {
+	name := flagCluster
+	// Get the default cluster
+	if name == "" {
+		name = config.Default
+	}
+	// Default cluster not set, pick the first one
+	if name == "" {
 		clusterConf = config.Clusters[0]
 		return clusterConf, nil
 	}
 	for _, s := range config.Clusters {
-		if s.Name == flagCluster {
+		if s.Name == name {
 			clusterConf = s
 			return s, nil
 		}
 	}
-	return nil, fmt.Errorf("unknown cluster %q", flagCluster)
+	return nil, fmt.Errorf("unknown cluster %q", name)
 }
-
-var appName string
 
 func app() (string, error) {
 	if flagApp != "" {
@@ -259,13 +276,21 @@ func app() (string, error) {
 func mustApp() string {
 	name, err := app()
 	if err != nil {
-		log.Fatal(err)
+		log.Println(err)
+		shutdown.ExitWithCode(1)
 	}
 	return name
 }
 
 func tabWriter() *tabwriter.Writer {
 	return tabwriter.NewWriter(os.Stdout, 1, 2, 2, ' ', 0)
+}
+
+func humanTime(ts *time.Time) string {
+	if ts == nil || ts.IsZero() {
+		return ""
+	}
+	return units.HumanDuration(time.Now().UTC().Sub(*ts)) + " ago"
 }
 
 func listRec(w io.Writer, a ...interface{}) {
@@ -277,4 +302,13 @@ func listRec(w io.Writer, a ...interface{}) {
 			w.Write([]byte{'\n'})
 		}
 	}
+}
+
+func compatCheck(client controller.Client, minVersion string) (bool, error) {
+	status, err := client.Status()
+	if err != nil {
+		return false, err
+	}
+	v := version.Parse(status.Version)
+	return v.Dev || !v.Before(version.Parse(minVersion)), nil
 }

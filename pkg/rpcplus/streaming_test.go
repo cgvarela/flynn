@@ -9,10 +9,6 @@ import (
 	"time"
 )
 
-const (
-	httpPath = "/srpc"
-)
-
 type StreamingArgs struct {
 	A     int
 	Count int
@@ -124,7 +120,7 @@ func TestStreamingRpc(t *testing.T) {
 
 	// log.Println("Closing")
 	client.Close()
-	for _ = range rowChan {
+	for range rowChan {
 	}
 	// log.Println("Closed")
 
@@ -184,7 +180,7 @@ func TestInterruptedCallByClient(t *testing.T) {
 	c := client.StreamGo("StreamingArith.Thrive", args, rowChan)
 	go c.CloseStream()
 	count := 0
-	for _ = range rowChan {
+	for range rowChan {
 		count++
 	}
 	if count == 100000 {

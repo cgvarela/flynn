@@ -9,34 +9,54 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/technoweenie/grohl"
 	"github.com/flynn/flynn/host/types"
+	"github.com/julienschmidt/httprouter"
+	"github.com/inconshreveable/log15"
 )
 
 type attachHandler struct {
 	state   *State
 	backend Backend
+
+	// attached is a map of job IDs which are currently attached and is
+	// used to prevent multiple clients attaching to interactive jobs (i.e.
+	// ones which have DisableLog set)
+	attached    map[string]struct{}
+	attachedMtx sync.Mutex
+
+	logger log15.Logger
 }
 
-func (h *attachHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+func newAttachHandler(state *State, backend Backend, logger log15.Logger) *attachHandler {
+	return &attachHandler{
+		state:    state,
+		backend:  backend,
+		logger:   logger,
+		attached: make(map[string]struct{}),
+	}
+}
+
+func (h *attachHandler) ServeHTTP(w http.ResponseWriter, req *http.Request, _ httprouter.Params) {
 	var attachReq host.AttachReq
 	if err := json.NewDecoder(req.Body).Decode(&attachReq); err != nil {
 		http.Error(w, "invalid JSON", 400)
 		return
 	}
+	w.Header().Set("Connection", "upgrade")
+	w.Header().Set("Upgrade", "flynn-attach/0")
+	w.WriteHeader(http.StatusSwitchingProtocols)
+
 	conn, _, err := w.(http.Hijacker).Hijack()
 	if err != nil {
 		return
 	}
-	conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.flynn.attach-hijack\r\n\r\n"))
 	h.attach(&attachReq, conn)
 }
 
 func (h *attachHandler) attach(req *host.AttachReq, conn io.ReadWriteCloser) {
 	defer conn.Close()
-
-	g := grohl.NewContext(grohl.Data{"fn": "attach", "job.id": req.JobID})
-	g.Log(grohl.Data{"at": "start"})
+	log := h.logger.New("fn", "attach", "job.id", req.JobID)
+	log.Info("starting")
 	attachWait := make(chan struct{})
 	job := h.state.AddAttacher(req.JobID, attachWait)
 	if job == nil {
@@ -45,7 +65,7 @@ func (h *attachHandler) attach(req *host.AttachReq, conn io.ReadWriteCloser) {
 			return
 		}
 		// TODO: add timeout
-		g.Log(grohl.Data{"at": "wait"})
+		log.Info("waiting for attach")
 		<-attachWait
 		job = h.state.GetJob(req.JobID)
 	}
@@ -62,10 +82,25 @@ func (h *attachHandler) attach(req *host.AttachReq, conn io.ReadWriteCloser) {
 		return
 	}
 
+	// if the job has DisableLog set and is already attached, return an
+	// error, otherwise mark it as attached
+	h.attachedMtx.Lock()
+	if _, ok := h.attached[job.Job.ID]; ok && job.Job.Config.DisableLog {
+		h.attachedMtx.Unlock()
+		writeError(host.ErrAttached.Error())
+		return
+	}
+	h.attached[job.Job.ID] = struct{}{}
+	h.attachedMtx.Unlock()
+	defer func() {
+		h.attachedMtx.Lock()
+		delete(h.attached, job.Job.ID)
+		h.attachedMtx.Unlock()
+	}()
+
 	writeMtx := &sync.Mutex{}
 	writeMtx.Lock()
 
-	success := make(chan struct{})
 	attached := make(chan struct{})
 	failed := make(chan struct{})
 	opts := &AttachRequest{
@@ -86,6 +121,9 @@ func (h *attachHandler) attach(req *host.AttachReq, conn io.ReadWriteCloser) {
 	if req.Flags&host.AttachFlagStderr != 0 {
 		opts.Stderr = newFrameWriter(2, w, writeMtx)
 	}
+	if req.Flags&host.AttachFlagInitLog != 0 {
+		opts.InitLog = newFrameWriter(3, w, writeMtx)
+	}
 
 	go func() {
 		defer func() {
@@ -96,13 +134,13 @@ func (h *attachHandler) attach(req *host.AttachReq, conn io.ReadWriteCloser) {
 
 		select {
 		case <-attached:
-			g.Log(grohl.Data{"at": "success"})
+			log.Info("successfully attached")
 			conn.Write([]byte{host.AttachSuccess})
 			writeMtx.Unlock()
 			close(attached)
-			close(success)
 		case <-failed:
-			g.Log(grohl.Data{"at": "failed"})
+			log.Error("failed to attach to job")
+			writeMtx.Unlock()
 			return
 		}
 		close(attachWait)
@@ -138,9 +176,9 @@ func (h *attachHandler) attach(req *host.AttachReq, conn io.ReadWriteCloser) {
 					return
 				}
 				signal := int(binary.BigEndian.Uint32(buf[:]))
-				g.Log(grohl.Data{"at": "signal", "signal": signal})
+				log.Info("signaling", "signal", signal)
 				if err := h.backend.Signal(req.JobID, signal); err != nil {
-					g.Log(grohl.Data{"at": "signal", "status": "error", "err": err})
+					log.Error("error signalling job", "err", err)
 					return
 				}
 			case host.AttachResize:
@@ -152,9 +190,9 @@ func (h *attachHandler) attach(req *host.AttachReq, conn io.ReadWriteCloser) {
 				}
 				height := binary.BigEndian.Uint16(buf[:])
 				width := binary.BigEndian.Uint16(buf[2:])
-				g.Log(grohl.Data{"at": "tty_resize", "height": height, "width": width})
+				log.Info("resizing tty", "height", height, "width", width)
 				if err := h.backend.ResizeTTY(req.JobID, height, width); err != nil {
-					g.Log(grohl.Data{"at": "tty_resize", "status": "error", "err": err})
+					log.Error("error resizing tty", "err", err)
 					return
 				}
 			default:
@@ -163,28 +201,20 @@ func (h *attachHandler) attach(req *host.AttachReq, conn io.ReadWriteCloser) {
 		}
 	}()
 
-	g.Log(grohl.Data{"at": "attach"})
+	log.Info("attaching")
 	if err := h.backend.Attach(opts); err != nil && err != io.EOF {
-		select {
-		case <-success:
-			if exit, ok := err.(ExitError); ok {
-				writeMtx.Lock()
-				w.WriteByte(host.AttachExit)
-				binary.Write(w, binary.BigEndian, uint32(exit))
-				w.Flush()
-				writeMtx.Unlock()
-				if exit == 0 {
-					err = nil
-				}
-			}
-		default:
+		if exit, ok := err.(ExitError); ok {
+			writeMtx.Lock()
+			w.WriteByte(host.AttachExit)
+			binary.Write(w, binary.BigEndian, uint32(exit))
+			w.Flush()
+			writeMtx.Unlock()
+		} else {
 			close(failed)
 			writeMtx.Lock()
 			writeError(err.Error())
 			writeMtx.Unlock()
-		}
-		if err != nil {
-			g.Log(grohl.Data{"at": "attach", "status": "error", "err": err.Error()})
+			log.Error("attach error", "err", err)
 		}
 	} else {
 		if opts.Stdout != nil {
@@ -194,7 +224,7 @@ func (h *attachHandler) attach(req *host.AttachReq, conn io.ReadWriteCloser) {
 			opts.Stderr.Close()
 		}
 	}
-	g.Log(grohl.Data{"at": "finish"})
+	log.Info("finished")
 }
 
 type ExitError int

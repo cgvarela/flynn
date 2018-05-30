@@ -8,6 +8,8 @@ import (
 	"errors"
 	"hash"
 	"net"
+
+	"github.com/flynn/flynn/pkg/dialer"
 )
 
 // A Config structure provides pinning and TLS connection information used to
@@ -38,7 +40,7 @@ func (c *Config) Dial(network, addr string) (net.Conn, error) {
 	}
 	conf.InsecureSkipVerify = true
 
-	cn, err := net.Dial(network, addr)
+	cn, err := dialer.Retry.Dial(network, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -48,7 +50,9 @@ func (c *Config) Dial(network, addr string) (net.Conn, error) {
 		Wire: cn,
 	}
 
-	conf.ServerName, _, _ = net.SplitHostPort(addr)
+	if conf.ServerName == "" {
+		conf.ServerName, _, _ = net.SplitHostPort(addr)
+	}
 
 	if err = conn.Handshake(); err != nil {
 		conn.Close()

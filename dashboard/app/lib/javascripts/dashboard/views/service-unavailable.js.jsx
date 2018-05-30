@@ -1,10 +1,4 @@
-/** @jsx React.DOM */
-
-(function () {
-
-"use strict";
-
-Dashboard.Views.ServiceUnavailable = React.createClass({
+var ServiceUnavailable = React.createClass({
 	displayName: "Views.ServiceUnavailable",
 
 	render: function () {
@@ -27,4 +21,4 @@ Dashboard.Views.ServiceUnavailable = React.createClass({
 	}
 });
 
-})();
+export default ServiceUnavailable;

@@ -1,9 +1,4 @@
-/** @jsx React.DOM */
-
-(function () {
-"use strict";
-
-Dashboard.Views.Timestamp = React.createClass({
+var Timestamp = React.createClass({
 	displayName: "Views.Timestamp",
 
 	getInitialState: function () {
@@ -63,4 +58,4 @@ Dashboard.Views.Timestamp = React.createClass({
 	}
 });
 
-})();
+export default Timestamp;

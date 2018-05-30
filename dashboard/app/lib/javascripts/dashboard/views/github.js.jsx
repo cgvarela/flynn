@@ -1,21 +1,14 @@
-/** @jsx React.DOM */
-//= require ./github-sources
-//= require ./github-repos
-//= require ./github-repo
-//= require ./route-link
+import GithubSources from './github-sources';
+import GithubRepos from './github-repos';
+import GithubRepo from './github-repo';
+import RouteLink from './route-link';
 
-(function () {
-
-"use strict";
-
-var RouteLink = Dashboard.Views.RouteLink;
-
-Dashboard.Views.Github = React.createClass({
+var Github = React.createClass({
 	displayName: "Views.Github",
 
 	render: function () {
 		return (
-			<section>
+			<section className="github-container">
 				<header className="page-header">
 					<h1>GitHub repos</h1>
 					<RouteLink path={this.props.getClusterPath()} className="back-link">
@@ -24,20 +17,20 @@ Dashboard.Views.Github = React.createClass({
 				</header>
 
 				<section className="panel">
-					<Dashboard.Views.GithubSources
+					<GithubSources
 						selectedSource={this.props.selectedSource} />
 				</section>
 
 				<section className="panel-row">
 					<section className="github-repos-panel">
-						<Dashboard.Views.GithubRepos
+						<GithubRepos
 							selectedSource={this.props.selectedSource}
 							selectedType={this.props.selectedType} />
 					</section>
 
 					<section className="github-repo-panel">
 						{this.props.selectedRepo ? (
-							<Dashboard.Views.GithubRepo
+							<GithubRepo
 								ownerLogin={this.props.selectedRepo.ownerLogin}
 								name={this.props.selectedRepo.name}
 								selectedPanel={this.props.selectedRepoPanel}
@@ -52,4 +45,4 @@ Dashboard.Views.Github = React.createClass({
 	}
 });
 
-})();
+export default Github;

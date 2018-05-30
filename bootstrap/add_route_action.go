@@ -2,8 +2,11 @@ package bootstrap
 
 import (
 	"fmt"
+	"time"
 
 	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/flynn/pkg/attempt"
+	"github.com/flynn/flynn/pkg/tlscert"
 	"github.com/flynn/flynn/router/types"
 )
 
@@ -33,22 +36,30 @@ func (a *AddRouteAction) Run(s *State) error {
 	if err != nil {
 		return err
 	}
-	if a.CertStep != "" {
-		if a.Route.Type != "http" {
-			return fmt.Errorf("bootstrap: invalid cert_step option for non-http route")
-		}
-		cert, err := getCertStep(s, a.CertStep)
-		if err != nil {
-			return err
-		}
+	if a.Route.Type == "http" {
 		route := a.Route.HTTPRoute()
 		route.Domain = interpolate(s, route.Domain)
-		route.TLSCert = cert.Cert
-		route.TLSKey = cert.PrivateKey
+		if a.CertStep != "" {
+			cert, err := getCertStep(s, a.CertStep)
+			if err != nil {
+				return err
+			}
+			route.Certificate = &router.Certificate{
+				Cert: cert.Cert,
+				Key:  cert.PrivateKey,
+			}
+		}
 		a.Route = route.ToRoute()
 	}
 
-	if err := client.CreateRoute(data.App.ID, a.Route); err != nil {
+	err = attempt.Strategy{
+		Min:   5,
+		Total: 10 * time.Second,
+		Delay: 200 * time.Millisecond,
+	}.Run(func() error {
+		return client.CreateRoute(data.App.ID, a.Route)
+	})
+	if err != nil {
 		return err
 	}
 	s.StepData[a.ID] = &AddRouteState{App: data.App, Route: a.Route}
@@ -64,8 +75,8 @@ func getAppStep(s *State, step string) (*AppState, error) {
 	return data, nil
 }
 
-func getCertStep(s *State, step string) (*TLSCert, error) {
-	data, ok := s.StepData[step].(*TLSCert)
+func getCertStep(s *State, step string) (*tlscert.Cert, error) {
+	data, ok := s.StepData[step].(*tlscert.Cert)
 	if !ok {
 		return nil, fmt.Errorf("bootstrap: unable to find step %q", step)
 	}

@@ -1,30 +1,32 @@
-//= require ./dispatcher
-(function () {
-"use strict";
+import { createClass, extend } from 'marbles/utils';
+import HTTP from 'marbles/http';
+import SerializeJSONMiddleware from 'marbles/http/middleware/serialize_json';
+import Dispatcher from './dispatcher';
 
-Dashboard.GithubClient = Marbles.Utils.createClass({
+var GithubClient = createClass({
 	displayName: "GithubClient",
 
 	mixins: [{
 		ctor: {
 			middleware: [
-				Marbles.HTTP.Middleware.SerializeJSON
+				SerializeJSONMiddleware
 			]
 		}
 	}],
 
-	willInitialize: function (accessToken) {
+	willInitialize: function (accessToken, apiURL) {
 		if ( !accessToken ) {
 			throw new Error(this.constructor.displayName +": Invalid client: "+ JSON.stringify(accessToken));
 		}
 		this.accessToken = accessToken;
+		this.apiURL = apiURL;
 	},
 
 	performRequest: function (method, path, args) {
 		args = args || {};
 
 		if ( !path ) {
-				var err = new Error(this.constructor.displayName +".prototype.performRequest(): Can't make request without path");
+			var err = new Error(this.constructor.displayName +".prototype.performRequest(): Can't make request without path");
 			setTimeout(function () {
 				throw err;
 			}.bind(this), 0);
@@ -40,13 +42,13 @@ Dashboard.GithubClient = Marbles.Utils.createClass({
 			}.bind(this)
 		}]);
 
-		return Marbles.HTTP(Marbles.Utils.extend({
+		return HTTP(extend({
 			method: method,
 			middleware: [].concat(this.constructor.middleware).concat(middleware),
-			headers: Marbles.Utils.extend({
+			headers: extend({
 				Accept: 'application/json'
 			}, args.headers || {}),
-			url: "https://api.github.com" + path
+			url: this.apiURL + path
 		}, args)).then(function (args) {
 			var res = args[0];
 			var xhr = args[1];
@@ -55,7 +57,7 @@ Dashboard.GithubClient = Marbles.Utils.createClass({
 					resolve([res, xhr]);
 				} else {
 					if (xhr.status === 401) {
-						Dashboard.Dispatcher.handleAppEvent({
+						Dispatcher.handleAppEvent({
 							name: "GITHUB_AUTH_CHANGE",
 							authenticated: false
 						});
@@ -74,6 +76,13 @@ Dashboard.GithubClient = Marbles.Utils.createClass({
 		return this.performRequest('GET', '/repos/'+ encodeURIComponent(owner) +'/'+ encodeURIComponent(repo));
 	},
 
+	getRepoTree: function (owner, repo, ref, params) {
+		params = params || [{}];
+		return this.performRequest('GET', '/repos/'+ encodeURIComponent(owner) +'/'+ encodeURIComponent(repo) +'/git/trees/'+ encodeURIComponent(ref), {
+			params: params
+		});
+	},
+
 	getOrgs: function () {
 		return this.performRequest('GET', '/user/orgs');
 	},
@@ -88,7 +97,7 @@ Dashboard.GithubClient = Marbles.Utils.createClass({
 
 	getOrgRepos: function (params) {
 		params = [].concat(params);
-		params[0] = Marbles.Utils.extend({}, params[0]);
+		params[0] = extend({}, params[0]);
 		var org = params[0].org;
 		delete params[0].org;
 		return this.performRequest('GET', '/orgs/'+ encodeURIComponent(org) +'/repos', {params: params});
@@ -126,4 +135,4 @@ Dashboard.GithubClient = Marbles.Utils.createClass({
 	}
 });
 
-})();
+export default GithubClient;

@@ -44,16 +44,15 @@ func main() {
 		return
 	}
 
-	client, err := client.New()
-	if err != nil {
-		log.Fatal(err)
-	}
+	client := client.New()
 
 	conf := &router.HTTPRoute{
 		Service: serviceName,
 		Domain:  domain,
-		TLSCert: string(tlsCert),
-		TLSKey:  string(tlsKey),
+		Certificate: &router.Certificate{
+			Cert: string(tlsCert),
+			Key:  string(tlsKey),
+		},
 	}
 	if err := client.CreateRoute(conf.ToRoute()); err != nil {
 		log.Fatal(err)

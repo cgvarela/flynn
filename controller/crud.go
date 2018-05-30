@@ -1,11 +1,14 @@
 package main
 
 import (
-	"encoding/json"
 	"net/http"
 	"reflect"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/go-martini/martini"
+	"github.com/flynn/flynn/controller/schema"
+	"github.com/flynn/flynn/pkg/ctxhelper"
+	"github.com/flynn/flynn/pkg/httphelper"
+	"github.com/julienschmidt/httprouter"
+	"golang.org/x/net/context"
 )
 
 type Repository interface {
@@ -18,78 +21,66 @@ type Remover interface {
 	Remove(string) error
 }
 
-type Updater interface {
-	Update(string, map[string]interface{}) (interface{}, error)
-}
-
-func crud(resource string, example interface{}, repo Repository, r martini.Router) interface{} {
+func crud(r *httprouter.Router, resource string, example interface{}, repo Repository) {
 	resourceType := reflect.TypeOf(example)
-	resourcePtr := reflect.PtrTo(resourceType)
 	prefix := "/" + resource
 
-	r.Post(prefix, func(req *http.Request, r ResponseHelper) {
+	r.POST(prefix, httphelper.WrapHandler(func(ctx context.Context, rw http.ResponseWriter, req *http.Request) {
 		thing := reflect.New(resourceType).Interface()
-		err := json.NewDecoder(req.Body).Decode(thing)
-		if err != nil {
-			r.Error(err)
+		if err := httphelper.DecodeJSON(req, thing); err != nil {
+			respondWithError(rw, err)
 			return
 		}
 
-		err = repo.Add(thing)
-		if err != nil {
-			r.Error(err)
+		if err := schema.Validate(thing); err != nil {
+			respondWithError(rw, err)
 			return
 		}
-		r.JSON(200, thing)
-	})
 
-	lookup := func(c martini.Context, params martini.Params, req *http.Request, r ResponseHelper) {
-		thing, err := repo.Get(params[resource+"_id"])
-		if err != nil {
-			r.Error(err)
+		if err := repo.Add(thing); err != nil {
+			respondWithError(rw, err)
 			return
 		}
-		c.Map(thing)
+		httphelper.JSON(rw, 200, thing)
+	}))
+
+	lookup := func(ctx context.Context) (interface{}, error) {
+		params, _ := ctxhelper.ParamsFromContext(ctx)
+		return repo.Get(params.ByName(resource + "_id"))
 	}
 
 	singletonPath := prefix + "/:" + resource + "_id"
-	r.Get(singletonPath, lookup, func(c martini.Context, r ResponseHelper) {
-		r.JSON(200, c.Get(resourcePtr).Interface())
-	})
-
-	r.Get(prefix, func(r ResponseHelper) {
-		list, err := repo.List()
+	r.GET(singletonPath, httphelper.WrapHandler(func(ctx context.Context, rw http.ResponseWriter, _ *http.Request) {
+		thing, err := lookup(ctx)
 		if err != nil {
-			r.Error(err)
+			respondWithError(rw, err)
 			return
 		}
-		r.JSON(200, list)
-	})
+		httphelper.JSON(rw, 200, thing)
+	}))
+
+	r.GET(prefix, httphelper.WrapHandler(func(ctx context.Context, rw http.ResponseWriter, _ *http.Request) {
+		list, err := repo.List()
+		if err != nil {
+			respondWithError(rw, err)
+			return
+		}
+		httphelper.JSON(rw, 200, list)
+	}))
 
 	if remover, ok := repo.(Remover); ok {
-		r.Delete(singletonPath, lookup, func(params martini.Params, r ResponseHelper) {
-			if err := remover.Remove(params[resource+"_id"]); err != nil {
-				r.Error(err)
-				return
-			}
-		})
-	}
-
-	if updater, ok := repo.(Updater); ok {
-		r.Post(singletonPath, func(params martini.Params, req *http.Request, r ResponseHelper) {
-			var data map[string]interface{}
-			if err := json.NewDecoder(req.Body).Decode(&data); err != nil {
-				r.Error(err)
-				return
-			}
-			app, err := updater.Update(params[resource+"_id"], data)
+		r.DELETE(singletonPath, httphelper.WrapHandler(func(ctx context.Context, rw http.ResponseWriter, _ *http.Request) {
+			_, err := lookup(ctx)
 			if err != nil {
-				r.Error(err)
+				respondWithError(rw, err)
 				return
 			}
-			r.JSON(200, app)
-		})
+			params, _ := ctxhelper.ParamsFromContext(ctx)
+			if err = remover.Remove(params.ByName(resource + "_id")); err != nil {
+				respondWithError(rw, err)
+				return
+			}
+			rw.WriteHeader(200)
+		}))
 	}
-
-	return lookup
 }

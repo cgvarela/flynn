@@ -18,7 +18,7 @@ vagrant ssh
 then build and bootstrap Flynn (this may take a few minutes):
 
 ```text
-tup
+make
 script/bootstrap-flynn
 ```
 
@@ -29,7 +29,7 @@ Run the `flynn cluster add` command from the bootstrap output to add the cluster
 ```text
 flynn cluster add ...
 cd ~/go/src/github.com/flynn/flynn/test
-bin/flynn-test --flynnrc ~/.flynnrc --cli `pwd`/../cli/cli
+bin/flynn-test --flynnrc ~/.flynnrc --cli `pwd`/../cli/bin/flynn
 ```
 
 ## Auto booting clusters
@@ -62,7 +62,7 @@ The tests interact with the VM cluster using the Flynn CLI, so you will need it 
 Download it into the current directory:
 
 ```text
-curl -sL -A "`uname -sp`" https://cli.flynn.io/flynn.gz | zcat >flynn
+curl -sL -A "`uname -sp`" https://dl.flynn.io/cli | zcat >flynn
 chmod +x flynn
 ```
 
@@ -78,35 +78,43 @@ sudo ./flynn-test \
 
 ## CI
 
-### Dependencies
+### Install the runner
 
-```text
-apt-add-repository 'deb http://ppa.launchpad.net/anatol/tup/ubuntu precise main'
-apt-key adv --keyserver keyserver.ubuntu.com --recv E601AAF9486D3664
-apt-get update
-apt-get install -y zerofree qemu qemu-kvm tup
+Install Git if not already installed, then check out the Flynn git repo and run
+the following to install the runner into `/opt/flynn-test`:
+
+```
+sudo test/scripts/install
+```
+
+Add the following credentials to `/opt/flynn-test/.credentials`:
+
+```
+export AUTH_KEY=XXXXXXXXXX
+export GITHUB_TOKEN=XXXXXXXXXX
+export AWS_ACCESS_KEY_ID=XXXXXXXXXX
+export AWS_SECRET_ACCESS_KEY=XXXXXXXXXX
+```
+
+Now start the runner:
+
+```
+sudo start flynn-test
 ```
 
 ### Updating the runner
 
-With the updated runner code checked out in your CI repo, build the runner:
+If the runner code has been changed, restart the Upstart job to pull in the new changes:
 
-```text
-cd /path/to/flynn/test
-go build -o bin/flynn-test-runner ./runner
+```
+sudo restart flynn-test
 ```
 
-If you need to rebuild the root filesystem, first stop the runner and unmount the build directory:
+If the rootfs needs rebuilding, you will need to remove the existing image before starting
+the runner again:
 
 ```
 sudo stop flynn-test
-sudo umount /opt/flynn-test/build
+sudo rm -rf /opt/flynn-test/build/{rootfs.img,vmlinuz}
+sudo start flynn-test
 ```
-
-Run the update script:
-
-```
-sudo scripts/update-runner.sh
-```
-
-Since `/etc/default/flynn-test` may contain secrets, the above does not change it so you may have to make some manual edits if `scripts/defaults.conf` has changed.

@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -10,23 +11,28 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/heroku/hk/term"
+	"github.com/docker/docker/pkg/term"
 	"github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/flynn/host/resource"
 	"github.com/flynn/flynn/pkg/cluster"
+	"github.com/flynn/flynn/pkg/shutdown"
+	"github.com/flynn/go-docopt"
 )
 
 func init() {
 	cmd := register("run", runRun, `
-usage: flynn run [-d] [-r <release>] [-e <entrypoint>] <command> [<argument>...]
+usage: flynn run [-d] [-r <release>] [-e <entrypoint>] [-l] [--limits <limits>] [--mounts-from <proc>] [--] <command> [<argument>...]
 
 Run a job.
 
 Options:
-	-d, --detached   run job without connecting io streams
-	-r <release>     id of release to run (defaults to current app release)
-	-e <entrypoint>  overwrite the default entrypoint of the release's image
+	-d, --detached        run job without connecting io streams (implies --enable-log)
+	-r <release>          id of release to run (defaults to current app release)
+	-e <entrypoint>       [DEPRECATED] overwrite the default entrypoint of the release's image
+	-l, --enable-log      send output to log streams
+	--limits <limits>     comma separated limits for the run job (see "flynn limit -h" for format)
+	--mounts-from <proc>  process type to copy mounts from
 `)
 	cmd.optsFirst = true
 }
@@ -34,48 +40,127 @@ Options:
 // Declared here for Windows portability
 const SIGWINCH syscall.Signal = 28
 
-func runRun(args *docopt.Args, client *controller.Client) error {
-	runDetached := args.Bool["--detached"]
-	runRelease := args.String["-r"]
-
-	if runRelease == "" {
-		release, err := client.GetAppRelease(mustApp())
+func runRun(args *docopt.Args, client controller.Client) error {
+	config := runConfig{
+		App:        mustApp(),
+		Detached:   args.Bool["--detached"],
+		Release:    args.String["-r"],
+		Args:       append([]string{args.String["<command>"]}, args.All["<argument>"].([]string)...),
+		ReleaseEnv: true,
+		Exit:       true,
+		DisableLog: !args.Bool["--detached"] && !args.Bool["--enable-log"],
+		MountsFrom: args.String["--mounts-from"],
+	}
+	if config.Release == "" {
+		release, err := client.GetAppRelease(config.App)
 		if err == controller.ErrNotFound {
 			return errors.New("No app release, specify a release with -release")
 		}
 		if err != nil {
 			return err
 		}
-		runRelease = release.ID
+		if len(release.ArtifactIDs) == 0 {
+			return errors.New("App release has no image, push a release first")
+		}
+		config.Release = release.ID
 	}
+	if e := args.String["-e"]; e != "" {
+		fmt.Fprintln(os.Stderr, "WARN: The -e flag is deprecated and will be removed in future versions, use <command> as the entrypoint")
+		config.Args = append([]string{e}, config.Args...)
+	}
+	if limits := args.String["--limits"]; limits != "" {
+		config.Resources = resource.Defaults()
+		resources, err := resource.ParseCSV(limits)
+		if err != nil {
+			return err
+		}
+		for typ, limit := range resources {
+			config.Resources[typ] = limit
+		}
+	}
+	return runJob(client, config)
+}
+
+type runConfig struct {
+	App        string
+	Detached   bool
+	Release    string
+	ReleaseEnv bool
+	Artifacts  []string
+	Args       []string
+	Env        map[string]string
+	Stdin      io.Reader
+	Stdout     io.Writer
+	Stderr     io.Writer
+	DisableLog bool
+	Exit       bool
+	Data       bool
+	Resources  resource.Resources
+	MountsFrom string
+
+	// DeprecatedArtifact is to support using an explicit artifact
+	// with old clusters which don't accept multiple artifacts
+	DeprecatedArtifact string
+}
+
+func runJob(client controller.Client, config runConfig) error {
 	req := &ct.NewJob{
-		Cmd:       append([]string{args.String["<command>"]}, args.All["<argument>"].([]string)...),
-		TTY:       term.IsTerminal(os.Stdin) && term.IsTerminal(os.Stdout) && !runDetached,
-		ReleaseID: runRelease,
-	}
-	if args.String["-e"] != "" {
-		req.Entrypoint = []string{args.String["-e"]}
-	}
-	if req.TTY {
-		cols, err := term.Cols()
-		if err != nil {
-			return err
-		}
-		lines, err := term.Lines()
-		if err != nil {
-			return err
-		}
-		req.Columns = cols
-		req.Lines = lines
-		req.Env = map[string]string{
-			"COLUMNS": strconv.Itoa(cols),
-			"LINES":   strconv.Itoa(lines),
-			"TERM":    os.Getenv("TERM"),
-		}
+		Args:               config.Args,
+		TTY:                config.Stdin == nil && config.Stdout == nil && term.IsTerminal(os.Stdin.Fd()) && term.IsTerminal(os.Stdout.Fd()) && !config.Detached,
+		ReleaseID:          config.Release,
+		ArtifactIDs:        config.Artifacts,
+		DeprecatedArtifact: config.DeprecatedArtifact,
+		Env:                config.Env,
+		ReleaseEnv:         config.ReleaseEnv,
+		DisableLog:         config.DisableLog,
+		Data:               config.Data,
+		Resources:          config.Resources,
+		MountsFrom:         config.MountsFrom,
 	}
 
-	if runDetached {
-		job, err := client.RunJobDetached(mustApp(), req)
+	// ensure slug apps from old clusters use /runner/init
+	release, err := client.GetRelease(req.ReleaseID)
+	if err != nil {
+		return err
+	}
+	if release.IsGitDeploy() && (len(req.Args) == 0 || req.Args[0] != "/runner/init") {
+		req.Args = append([]string{"/runner/init"}, req.Args...)
+	}
+
+	// set deprecated Entrypoint and Cmd for old clusters
+	if len(req.Args) > 0 {
+		req.DeprecatedEntrypoint = []string{req.Args[0]}
+	}
+	if len(req.Args) > 1 {
+		req.DeprecatedCmd = req.Args[1:]
+	}
+
+	if config.Stdin == nil {
+		config.Stdin = os.Stdin
+	}
+	if config.Stdout == nil {
+		config.Stdout = os.Stdout
+	}
+	if config.Stderr == nil {
+		config.Stderr = os.Stderr
+	}
+	if req.TTY {
+		if req.Env == nil {
+			req.Env = make(map[string]string)
+		}
+		ws, err := term.GetWinsize(os.Stdin.Fd())
+		if err != nil {
+			return err
+		}
+		req.Columns = int(ws.Width)
+		req.Lines = int(ws.Height)
+		req.Env["COLUMNS"] = strconv.Itoa(int(ws.Width))
+		req.Env["LINES"] = strconv.Itoa(int(ws.Height))
+		req.Env["TERM"] = os.Getenv("TERM")
+	}
+
+	if config.Detached {
+		job, err := client.RunJobDetached(config.App, req)
 		if err != nil {
 			return err
 		}
@@ -83,55 +168,72 @@ func runRun(args *docopt.Args, client *controller.Client) error {
 		return nil
 	}
 
-	rwc, err := client.RunJobAttached(mustApp(), req)
+	rwc, err := client.RunJobAttached(config.App, req)
 	if err != nil {
 		return err
 	}
 	defer rwc.Close()
 	attachClient := cluster.NewAttachClient(rwc)
 
+	var termState *term.State
 	if req.TTY {
-		if err := term.MakeRaw(os.Stdin); err != nil {
+		termState, err = term.MakeRaw(os.Stdin.Fd())
+		if err != nil {
 			return err
 		}
-		defer term.Restore(os.Stdin)
+		// Restore the terminal if we return without calling os.Exit
+		defer term.RestoreTerminal(os.Stdin.Fd(), termState)
 		go func() {
-			ch := make(chan os.Signal)
+			ch := make(chan os.Signal, 1)
 			signal.Notify(ch, SIGWINCH)
-			<-ch
-			height, err := term.Lines()
-			if err != nil {
-				return
+			for range ch {
+				ws, err := term.GetWinsize(os.Stdin.Fd())
+				if err != nil {
+					return
+				}
+				attachClient.ResizeTTY(ws.Height, ws.Width)
+				attachClient.Signal(int(SIGWINCH))
 			}
-			width, err := term.Cols()
-			if err != nil {
-				return
-			}
-			attachClient.ResizeTTY(uint16(height), uint16(width))
-			attachClient.Signal(int(SIGWINCH))
 		}()
 	}
 
 	go func() {
-		ch := make(chan os.Signal)
+		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 		sig := <-ch
 		attachClient.Signal(int(sig.(syscall.Signal)))
 		time.Sleep(10 * time.Second)
 		attachClient.Signal(int(syscall.SIGKILL))
 	}()
+
 	go func() {
-		io.Copy(attachClient, os.Stdin)
+		io.Copy(attachClient, config.Stdin)
 		attachClient.CloseWrite()
 	}()
-	exitStatus, err := attachClient.Receive(os.Stdout, os.Stderr)
+
+	childDone := make(chan struct{})
+	shutdown.BeforeExit(func() {
+		<-childDone
+	})
+	exitStatus, err := attachClient.Receive(config.Stdout, config.Stderr)
+	close(childDone)
 	if err != nil {
 		return err
 	}
 	if req.TTY {
-		term.Restore(os.Stdin)
+		term.RestoreTerminal(os.Stdin.Fd(), termState)
 	}
-	os.Exit(exitStatus)
+	if config.Exit {
+		shutdown.ExitWithCode(exitStatus)
+	}
+	if exitStatus != 0 {
+		return RunExitError(exitStatus)
+	}
+	return nil
+}
 
-	panic("unreached")
+type RunExitError int
+
+func (e RunExitError) Error() string {
+	return fmt.Sprintf("remote job exited with status %d", e)
 }

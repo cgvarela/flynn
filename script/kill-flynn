@@ -9,67 +9,37 @@ usage() {
   cat <<USAGE >&2
 usage: $0 [options]
 
+Kill running flynn-host daemons.
+
 OPTIONS:
-  -h            Show this message
-  -b BACKEND    The job backend to use (either docker or libvirt-lxc) [default: libvirt-lxc]
+  -h, --help            Show this message
 USAGE
 }
 
 main() {
-  local backend
+  if [[ $1 = "-h" ]] || [[ $1 = "--help" ]]; then
+    usage
+    exit 0
+  fi
 
-  while getopts "hb:" opt; do
-    case $opt in
-      h)
-	usage
-	exit 1
-	;;
-      b)
-	backend=$OPTARG
-	;;
-      ?)
-	usage
-	exit 1
-	;;
-    esac
-  done
+  if [[ $# -ne 0 ]]; then
+    usage
+    exit 1
+  fi
 
-  backend=${backend:-"libvirt-lxc"}
-
-  case "${backend}" in
-    libvirt-lxc)
-      kill_libvirt_lxc
-      ;;
-    docker)
-      kill_docker
-      ;;
-    *)
-      usage
-      exit 1
-      ;;
-  esac
-}
-
-kill_libvirt_lxc() {
-  local flynn_host="${ROOT}/host/bin/flynn-host"
-
-  info "killing running libvirt-lxc flynn-host, if any"
+  info "killing running flynn-host, if any"
   sudo start-stop-daemon \
     --stop \
     --oknodo \
     --retry 15 \
-    --exec "${flynn_host}"
+    --name "flynn-host"
 
-  info "done!"
-}
-
-kill_docker() {
-  local id=$(docker ps | grep flynn-host | cut -d" " -f 1)
-
-  info "killing running docker flynn-host, if any"
-  if [[ -n "${id}" ]]; then
-    docker stop "${id}" >/dev/null
-  fi
+  # force kill any remaining containers
+  sudo start-stop-daemon \
+    --stop \
+    --oknodo \
+    --retry 15 \
+    --name ".containerinit"
 
   info "done!"
 }

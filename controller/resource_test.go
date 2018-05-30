@@ -4,53 +4,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"net"
 	"net/http"
 	"net/http/httptest"
 
-	. "github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/check.v1"
+	"github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/discoverd/agent"
-	"github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/pkg/random"
-	"github.com/flynn/flynn/pkg/resource"
+	. "github.com/flynn/go-check"
 )
 
-type fakeServiceSet struct {
-	fn func() []*discoverd.Service
-}
-
-func (s *fakeServiceSet) SelfAddr() string { return "" }
-
-func (s *fakeServiceSet) Leader() *discoverd.Service { return nil }
-
-func (s *fakeServiceSet) Leaders() chan *discoverd.Service { return nil }
-
-func (s *fakeServiceSet) Services() []*discoverd.Service { return s.fn() }
-
-func (s *fakeServiceSet) Addrs() []string { return nil }
-
-func (s *fakeServiceSet) Select(attrs map[string]string) []*discoverd.Service { return nil }
-
-func (s *fakeServiceSet) Filter(attrs map[string]string) {}
-
-func (s *fakeServiceSet) Watch(bringCurrent bool) chan *agent.ServiceUpdate { return nil }
-
-func (s *fakeServiceSet) Unwatch(chan *agent.ServiceUpdate) {}
-
-func (s *fakeServiceSet) Close() error { return nil }
-
-type resourceDiscoverd struct {
-	fn func() []*discoverd.Service
-}
-
-func (d *resourceDiscoverd) NewServiceSet(name string) (discoverd.ServiceSet, error) {
-	return &fakeServiceSet{d.fn}, nil
-}
-
-func (s *S) provisionTestResource(c *C, name string, apps []string) (*ct.Resource, *ct.Provider) {
+func (s *S) provisionTestResourceWithServer(c *C, name string, apps []string) (*ct.Resource, *ct.Provider, *httptest.Server) {
 	data := []byte(`{"foo":"bar"}`)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == "DELETE" {
+			w.WriteHeader(200)
+			return
+		}
 		c.Assert(req.URL.Path, Equals, "/things")
 		in, err := ioutil.ReadAll(req.Body)
 		c.Assert(err, IsNil)
@@ -58,25 +27,18 @@ func (s *S) provisionTestResource(c *C, name string, apps []string) (*ct.Resourc
 		w.Write([]byte(fmt.Sprintf(`{"id":"/things/%s","env":{"foo":"baz"}}`, name)))
 	})
 	srv := httptest.NewServer(handler)
-	defer srv.Close()
 
-	host, port, _ := net.SplitHostPort(srv.Listener.Addr().String())
-	s.m.MapTo(&resourceDiscoverd{
-		fn: func() []*discoverd.Service {
-			return []*discoverd.Service{{
-				Addr: srv.Listener.Addr().String(),
-				Host: host,
-				Port: port,
-			}}
-		},
-	}, (*resource.DiscoverdClient)(nil))
-
-	p := s.createTestProvider(c, &ct.Provider{URL: fmt.Sprintf("discoverd+http://%s/things", name), Name: name})
+	p := &ct.Provider{URL: fmt.Sprintf("http://%s/things", srv.Listener.Addr()), Name: name}
+	c.Assert(s.c.CreateProvider(p), IsNil)
 	conf := json.RawMessage(data)
-	out := &ct.Resource{}
-	res, err := s.Post("/providers/"+p.ID+"/resources", &ct.ResourceReq{Config: &conf, Apps: apps}, out)
+	out, err := s.c.ProvisionResource(&ct.ResourceReq{ProviderID: p.ID, Config: &conf, Apps: apps})
 	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
+	return out, p, srv
+}
+
+func (s *S) provisionTestResource(c *C, name string, apps []string) (*ct.Resource, *ct.Provider) {
+	out, p, srv := s.provisionTestResourceWithServer(c, name, apps)
+	srv.Close()
 	return out, p
 }
 
@@ -91,14 +53,12 @@ func (s *S) TestProvisionResource(c *C) {
 	c.Assert(resource.ID, Not(Equals), "")
 	c.Assert(resource.Apps, DeepEquals, []string{app1.ID, app2.ID})
 
-	gotResource := &ct.Resource{}
-	path := fmt.Sprintf("/providers/%s/resources/%s", provider.ID, resource.ID)
-	res, err := s.Get(path, gotResource)
+	gotResource, err := s.c.GetResource(provider.ID, resource.ID)
 	c.Assert(err, IsNil)
 	c.Assert(gotResource, DeepEquals, resource)
 
-	res, err = s.Get(path+"fail", gotResource)
-	c.Assert(res.StatusCode, Equals, 404)
+	_, err = s.c.GetResource(provider.ID, resource.ID+"fail")
+	c.Assert(err, Equals, controller.ErrNotFound)
 }
 
 func (s *S) TestPutResource(c *C) {
@@ -106,26 +66,66 @@ func (s *S) TestPutResource(c *C) {
 	provider := s.createTestProvider(c, &ct.Provider{URL: "https://example.ca", Name: "put-resource"})
 
 	resource := &ct.Resource{
+		ID:         random.UUID(),
+		ProviderID: provider.ID,
 		ExternalID: "/foo/bar",
 		Env:        map[string]string{"FOO": "BAR"},
 		Apps:       []string{app.ID},
 	}
-	id := random.UUID()
-	path := fmt.Sprintf("/providers/%s/resources/%s", provider.ID, id)
-	created := &ct.Resource{}
-	_, err := s.Put(path, resource, created)
-	c.Assert(err, IsNil)
+	c.Assert(s.c.PutResource(resource), IsNil)
 
-	c.Assert(created.ID, Equals, id)
-	c.Assert(created.ProviderID, Equals, provider.ID)
-	c.Assert(created.Env, DeepEquals, resource.Env)
-	c.Assert(created.Apps, DeepEquals, resource.Apps)
-	c.Assert(created.CreatedAt, Not(IsNil))
+	c.Assert(resource.ProviderID, Equals, provider.ID)
+	c.Assert(resource.CreatedAt, Not(IsNil))
 
-	gotResource := &ct.Resource{}
-	_, err = s.Get(path, gotResource)
+	gotResource, err := s.c.GetResource(provider.ID, resource.ID)
 	c.Assert(err, IsNil)
-	c.Assert(gotResource, DeepEquals, created)
+	c.Assert(gotResource, DeepEquals, resource)
+}
+
+func (s *S) TestAddResourceApp(c *C) {
+	app1 := s.createTestApp(c, &ct.App{Name: "add-resource-app1"})
+	app2 := s.createTestApp(c, &ct.App{Name: "add-resource-app2"})
+	resource, provider := s.provisionTestResource(c, "add-resource-app", []string{})
+
+	gotResource, err := s.c.AddResourceApp(provider.ID, resource.ID, app1.ID)
+	c.Assert(err, IsNil)
+	c.Assert(gotResource.Apps, DeepEquals, []string{app1.ID})
+
+	gotResource, err = s.c.AddResourceApp(provider.ID, resource.ID, app2.ID)
+	c.Assert(err, IsNil)
+	c.Assert(gotResource.Apps, DeepEquals, []string{app1.ID, app2.ID})
+}
+
+func (s *S) TestDeleteResourceApp(c *C) {
+	app1 := s.createTestApp(c, &ct.App{Name: "delete-resource-app1"})
+	app2 := s.createTestApp(c, &ct.App{Name: "delete-resource-app2"})
+	resource, provider := s.provisionTestResource(c, "delete-resource-app", []string{app1.ID, app2.ID})
+
+	gotResource, err := s.c.DeleteResourceApp(provider.ID, resource.ID, app1.ID)
+	c.Assert(err, IsNil)
+	c.Assert(gotResource.Apps, DeepEquals, []string{app2.ID})
+
+	gotResource, err = s.c.DeleteResourceApp(provider.ID, resource.ID, app2.ID)
+	c.Assert(err, IsNil)
+	c.Assert(gotResource.Apps, IsNil)
+}
+
+func (s *S) TestDeleteResourceAppThenAdd(c *C) {
+	app1 := s.createTestApp(c, &ct.App{Name: "delete-then-add-resource-app1"})
+	app2 := s.createTestApp(c, &ct.App{Name: "delete-then-add-resource-app2"})
+	resource, provider := s.provisionTestResource(c, "delete-then-add-resource-app", []string{app1.ID, app2.ID})
+
+	gotResource, err := s.c.DeleteResourceApp(provider.ID, resource.ID, app1.ID)
+	c.Assert(err, IsNil)
+	c.Assert(gotResource.Apps, DeepEquals, []string{app2.ID})
+
+	gotResource, err = s.c.DeleteResourceApp(provider.ID, resource.ID, app2.ID)
+	c.Assert(err, IsNil)
+	c.Assert(gotResource.Apps, IsNil)
+
+	gotResource, err = s.c.AddResourceApp(provider.ID, resource.ID, app1.ID)
+	c.Assert(err, IsNil)
+	c.Assert(gotResource.Apps, DeepEquals, []string{app1.ID})
 }
 
 func (s *S) TestResourceLists(c *C) {
@@ -135,21 +135,37 @@ func (s *S) TestResourceLists(c *C) {
 
 	resource, provider := s.provisionTestResource(c, "resource-list", apps)
 
-	paths := []string{
-		fmt.Sprintf("/providers/%s/resources", provider.ID),
-		fmt.Sprintf("/providers/%s/resources", provider.Name),
-		fmt.Sprintf("/apps/%s/resources", app1.ID),
-		fmt.Sprintf("/apps/%s/resources", app1.Name),
-	}
-
-	for _, path := range paths {
-		var list []*ct.Resource
-		res, err := s.Get(path, &list)
+	check := func(list []*ct.Resource, err error) {
 		c.Assert(err, IsNil)
-		c.Assert(res.StatusCode, Equals, 200)
 
 		c.Assert(len(list) > 0, Equals, true)
 		c.Assert(list[0].ID, Equals, resource.ID)
 		c.Assert(list[0].Apps, DeepEquals, apps)
 	}
+
+	check(s.c.ResourceList(provider.ID))
+	check(s.c.ResourceList(provider.Name))
+	check(s.c.AppResourceList(app1.ID))
+	check(s.c.AppResourceList(app2.ID))
+	check(s.c.ResourceListAll())
+}
+
+func (s *S) TestAppResourceListWithDeletedAppResource(c *C) {
+	app1 := s.createTestApp(c, &ct.App{Name: "resource-app-list1"})
+	app2 := s.createTestApp(c, &ct.App{Name: "resource-app-list2"})
+
+	resource, provider := s.provisionTestResource(c, "resource-app-list", []string{app1.ID, app2.ID})
+
+	_, err := s.c.DeleteResourceApp(provider.ID, resource.ID, app1.ID)
+	c.Assert(err, IsNil)
+
+	list, err := s.c.AppResourceList(app1.ID)
+	c.Assert(err, IsNil)
+	c.Assert(len(list), Equals, 0)
+
+	list, err = s.c.AppResourceList(app2.ID)
+	c.Assert(err, IsNil)
+	c.Assert(len(list), Equals, 1)
+	c.Assert(list[0].ID, Equals, resource.ID)
+	c.Assert(list[0].Apps, DeepEquals, []string{app2.ID})
 }

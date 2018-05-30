@@ -1,29 +1,26 @@
-/** @jsx React.DOM */
-//= require ../stores/github-commit
-//= require ../stores/github-pull
-//= require ../stores/app
-//= require ../stores/job-output
-//= require ../actions/github-deploy
-//= require ./github-commit
-//= require ./github-pull
-//= require ./edit-env
-//= require ./command-output
-//= require ./route-link
-//= require Modal
+import { assertEqual, extend } from 'marbles/utils';
+import Modal from 'Modal';
+import GithubRepoStore from '../stores/github-repo';
+import GithubCommitStore from '../stores/github-commit';
+import GithubPullStore from '../stores/github-pull';
+import BuildpackStore from '../stores/github-repo-buildpack';
+import JobOutputStore from '../stores/job-output';
+import { AppDeployStore } from 'dashboard/stores/app-deploy';
+import RouteLink from './route-link';
+import CommandOutput from './command-output';
+import EditEnv from './edit-env';
+import GithubCommit from './github-commit';
+import GithubPull from './github-pull';
+import ProviderPicker from 'dashboard/views/provider-picker';
+import GithubRepoBuildpack from './github-repo-buildpack';
+import Dispatcher from 'dashboard/dispatcher';
 
-(function () {
-
-"use strict";
-
-var GithubRepoStore = Dashboard.Stores.GithubRepo;
-var GithubCommitStore = Dashboard.Stores.GithubCommit;
-var GithubPullStore = Dashboard.Stores.GithubPull;
-var JobOutputStore = Dashboard.Stores.JobOutput;
-
-var GithubDeployActions = Dashboard.Actions.GithubDeploy;
-
-var RouteLink = Dashboard.Views.RouteLink;
-var Modal = window.Modal;
+function getDeployStoreId (props) {
+	return {
+		appID: props.appID,
+		sha: props.sha
+	};
+}
 
 function getRepoStoreId (props) {
 	return {
@@ -48,21 +45,62 @@ function getPullStoreId (props) {
 	};
 }
 
-function getJobOutputStoreId (props) {
-	if ( !props.job ) {
-		return null;
-	}
+function getBuildpackStoreId (props, commit, pull) {
 	return {
-		appId: props.appId,
-		jobId: props.job.id
+		ownerLogin: props.ownerLogin,
+		repoName: props.repoName,
+		ref: commit ? commit.sha : (pull ? pull.head.sha : props.branchName)
 	};
 }
 
-function getState (props, prevState) {
+function getState (props, prevState, providerIDs) {
 	prevState = prevState || {};
 	var state = {
-		launching: prevState.launching
+		launching: prevState.launching,
+		deleting: prevState.deleting,
+		env: prevState.env || {},
+		name: prevState.name,
+		providerIDs: providerIDs === undefined ? prevState.providerIDs : providerIDs
 	};
+
+	state.deployStoreId = getDeployStoreId(props);
+	var deployState = AppDeployStore.getState(state.deployStoreId);
+	state.launching = deployState.launching;
+	state.launchSuccess = deployState.launchSuccess;
+	state.launchFailed = deployState.launchFailed;
+	state.launchErrorMsg = deployState.launchErrorMsg;
+	if (deployState.name !== null) {
+		state.name = deployState.name;
+	}
+	if (deployState.release !== null) {
+		state.env = deployState.release.env || {};
+	}
+
+	state.jobOutputStoreId = null;
+	if (deployState.taffyJob !== null) {
+		state.jobOutputStoreId = {
+			appId: 'taffy',
+			jobId: deployState.taffyJob.id,
+			lines: 10000 // show full backlog
+		};
+	}
+	var prevJobOutputStoreId = prevState.jobOutputStoreId;
+	var nextJobOutputStoreId = state.jobOutputStoreId;
+	if ( !assertEqual(prevJobOutputStoreId, nextJobOutputStoreId) ) {
+		if (prevJobOutputStoreId) {
+			JobOutputStore.removeChangeListener(prevJobOutputStoreId, this.__handleStoreChange);
+		}
+		if (nextJobOutputStoreId !== null) {
+			JobOutputStore.addChangeListener(nextJobOutputStoreId, this.__handleStoreChange);
+		}
+	}
+
+	var jobOutputState;
+	if (state.jobOutputStoreId !== null) {
+		jobOutputState = JobOutputStore.getState(state.jobOutputStoreId);
+		state.jobOutput = jobOutputState.output;
+		state.jobError = jobOutputState.streamError;
+	}
 
 	if (props.pullNumber) {
 		state.pullStoreId = getPullStoreId(props);
@@ -72,35 +110,27 @@ function getState (props, prevState) {
 		state.commit = GithubCommitStore.getState(state.commitStoreId).commit;
 	}
 
+	var prevBuildpackStoreId = prevState.buildpackStoreId;
+	var nextBuildpackStoreId = getBuildpackStoreId(props, state.commit, state.pull);
+	if ( !assertEqual(prevBuildpackStoreId, nextBuildpackStoreId) ) {
+		BuildpackStore.removeChangeListener(prevBuildpackStoreId, this.__handleStoreChange);
+		BuildpackStore.addChangeListener(nextBuildpackStoreId, this.__handleStoreChange);
+	}
+	state.buildpackStoreId = nextBuildpackStoreId;
+	state.buildpack = BuildpackStore.getState(state.buildpackStoreId);
+	if (state.buildpack.unknown && !state.env.BUILDPACK_URL) {
+		state.env.BUILDPACK_URL = "";
+	}
+
 	state.repoStoreId = getRepoStoreId(props);
 	state.repo = GithubRepoStore.getState(state.repoStoreId).repo;
 
-	var jobOutputState;
-	if (props.job) {
-		state.jobOutputStoreId = getJobOutputStoreId(props);
-		jobOutputState = JobOutputStore.getState(state.jobOutputStoreId);
-		state.jobOutput = jobOutputState.output;
-		state.jobError = jobOutputState.streamError;
-
-		if (jobOutputState.open === false) {
-			state.launching = false;
-		} else {
-			state.launching = true;
-		}
-	}
-
-	state.launchComplete = props.appId && !state.launching && !state.jobError && !props.errorMsg;
-	state.launchDisabled = props.launchDisabled || !!(!state.repo || !(state.commit || state.pull) || state.launching);
-
-	if (props.errorMsg) {
-		state.launchDisabled = false;
-		state.launching = false;
-	}
+	state.launchDisabled = props.launchDisabled || !!(!state.repo || !(state.commit || state.pull) || state.launching || state.deleting);
 
 	return state;
 }
 
-Dashboard.Views.GithubDeploy = React.createClass({
+var GithubDeploy = React.createClass({
 	displayName: "Views.GithubDeploy",
 
 	render: function () {
@@ -114,49 +144,66 @@ Dashboard.Views.GithubDeploy = React.createClass({
 						{this.props.ownerLogin +"/"+ this.props.repoName +":"+ this.props.branchName}
 					</h2>
 					{commit ? (
-						<Dashboard.Views.GithubCommit commit={commit} />
+						<GithubCommit commit={commit} />
 					) : (pull ? (
-						<Dashboard.Views.GithubPull pull={pull} />
+						<GithubPull pull={pull} />
 					) : null)}
+
+					<GithubRepoBuildpack
+						ownerLogin={this.props.ownerLogin}
+						repoName={this.props.repoName}
+						selectedBranchName={this.state.buildpackStoreId.ref} />
 				</header>
 
 				{this.props.children}
 
-				<label>
-					<span className="name">Name</span>
-					<input type="text" value={this.state.name} onChange={this.__handleNameChange} />
-				</label>
+				{this.state.launching ? null : (
+					<div>
+						<label>
+							<span className="name">Name</span>
+							<input type="text" value={this.state.name} onChange={this.__handleNameChange} />
+						</label>
 
-				<label>
-					<span className="name">Postgres</span>
-					<input type="checkbox" checked={this.state.db} onChange={this.__handleDbChange} />
-				</label>
+						{this.state.launching || this.state.deleting || this.state.launchSuccess || this.state.launchFailed ? null : (
+							<ProviderPicker
+								selected={this.state.providers}
+								onChange={this.__handleProvidersChange} />
+						)}
 
-				<Dashboard.Views.EditEnv env={this.state.env} onChange={this.__handleEnvChange} />
+						<EditEnv
+							disabled={this.state.launching || this.state.deleting || this.state.launchSuccess || this.state.launchFailed}
+							env={this.state.env}
+							onChange={this.__handleEnvChange} />
+					</div>
+				)}
 
 				{this.state.jobOutput ? (
-					<Dashboard.Views.CommandOutput outputStreamData={this.state.jobOutput} />
+					<CommandOutput outputStreamData={this.state.jobOutput} showTimestamp={false} />
 				) : null}
 
 				{this.props.errorMsg ? (
 					<div className="alert-error">{this.props.errorMsg}</div>
 				) : null}
 
-				{this.state.jobError ? (
-					<div className="alert-error">{this.state.jobError}</div>
+				{this.state.launchErrorMsg !== null ? (
+					<div className="alert-error">{this.state.launchErrorMsg}</div>
 				) : null}
 
-				{this.state.launchComplete ? (
+				{this.state.launchSuccess === true ? (
 					<RouteLink className="launch-btn" path={this.props.getAppPath()}>Continue</RouteLink>
 				) : (
-					<button className="launch-btn" disabled={this.state.launchDisabled} onClick={this.__handleLaunchBtnClick}>{this.state.launching ? "Launching..." : "Launch app"}</button>
+					(this.state.launchFailed === true ? (
+						<button className="delete-btn" disabled={this.state.launchDisabled} onClick={this.__handleDeleteBtnClick}>{this.state.deleting ? "Deleting..." : "Launch failed. Delete app"}</button>
+					) : (
+						<button className="launch-btn" disabled={this.state.launchDisabled} onClick={this.__handleLaunchBtnClick}>{this.state.launching ? "Launching..." : "Launch app"}</button>
+					))
 				)}
 			</Modal>
 		);
 	},
 
 	getInitialState: function () {
-		return Marbles.Utils.extend(getState(this.props), {
+		return getState.call(this, this.props, {
 			name: this.__formatName([this.props.ownerLogin, this.props.repoName, this.props.branchName].join("-")),
 			db: false,
 			env: {}
@@ -164,6 +211,7 @@ Dashboard.Views.GithubDeploy = React.createClass({
 	},
 
 	componentDidMount: function () {
+		AppDeployStore.addChangeListener(this.state.deployStoreId, this.__handleStoreChange);
 		GithubRepoStore.addChangeListener(this.state.repoStoreId, this.__handleStoreChange);
 		if (this.state.commitStoreId) {
 			GithubCommitStore.addChangeListener(this.state.commitStoreId, this.__handleStoreChange);
@@ -171,27 +219,32 @@ Dashboard.Views.GithubDeploy = React.createClass({
 		if (this.state.pullStoreId) {
 			GithubPullStore.addChangeListener(this.state.pullStoreId, this.__handleStoreChange);
 		}
-		if (this.state.jobOutputStoreId) {
+		if (this.state.buildpackStoreId) {
+			BuildpackStore.addChangeListener(this.state.buildpackStoreId, this.__handleStoreChange);
+		}
+		if (this.state.jobOutputStoreId !== null) {
 			JobOutputStore.addChangeListener(this.state.jobOutputStoreId, this.__handleStoreChange);
 		}
 	},
 
 	componentWillReceiveProps: function (props) {
-		if (props.env) {
-			this.setState({
-				env: props.env
-			});
-		}
-
 		var didChange = false;
 
 		if (props.errorMsg) {
 			didChange = true;
 		}
 
+		var prevDeployStoreId = this.state.deployStoreId;
+		var nextDeployStoreId = getDeployStoreId(props);
+		if ( !assertEqual(prevDeployStoreId, nextDeployStoreId) ) {
+			AppDeployStore.removeChangeListener(prevDeployStoreId, this.__handleStoreChange);
+			AppDeployStore.addChangeListener(nextDeployStoreId, this.__handleStoreChange);
+			didChange = true;
+		}
+
 		var prevRepoStoreId = this.state.repoStoreId;
 		var nextRepoStoreId = getRepoStoreId(props);
-		if ( !Marbles.Utils.assertEqual(prevRepoStoreId, nextRepoStoreId) ) {
+		if ( !assertEqual(prevRepoStoreId, nextRepoStoreId) ) {
 			GithubRepoStore.addChangeListener(prevRepoStoreId, this.__handleStoreChange);
 			GithubRepoStore.removeChangeListener(nextRepoStoreId, this.__handleStoreChange);
 			didChange = true;
@@ -200,7 +253,7 @@ Dashboard.Views.GithubDeploy = React.createClass({
 		if (this.state.commitStoreId) {
 			var prevCommitStoreId = this.state.commitStoreId;
 			var nextCommitStoreId = getCommitStoreId(props);
-			if ( !Marbles.Utils.assertEqual(prevCommitStoreId, nextCommitStoreId) ) {
+			if ( !assertEqual(prevCommitStoreId, nextCommitStoreId) ) {
 				GithubCommitStore.removeChangeListener(prevCommitStoreId, this.__handleStoreChange);
 				GithubCommitStore.addChangeListener(nextCommitStoreId, this.__handleStoreChange);
 				didChange = true;
@@ -210,23 +263,11 @@ Dashboard.Views.GithubDeploy = React.createClass({
 		if (this.state.pullStoreId) {
 			var prevPullStoreId = this.state.pullStoreId;
 			var nextPullStoreId = getPullStoreId(props);
-			if ( !Marbles.Utils.assertEqual(prevPullStoreId, nextPullStoreId) ) {
+			if ( !assertEqual(prevPullStoreId, nextPullStoreId) ) {
 				GithubPullStore.removeChangeListener(prevPullStoreId, this.__handleStoreChange);
 				GithubPullStore.addChangeListener(nextPullStoreId, this.__handleStoreChange);
 				didChange = true;
 			}
-		}
-
-		var prevJobOutputStoreId = this.state.jobOutputStoreId;
-		var nextJobOutputStoreId = getJobOutputStoreId(props);
-		if ( !Marbles.Utils.assertEqual(prevJobOutputStoreId, nextJobOutputStoreId) ) {
-			if (prevJobOutputStoreId) {
-				JobOutputStore.removeChangeListener(prevJobOutputStoreId, this.__handleStoreChange);
-			}
-			if (nextJobOutputStoreId) {
-				JobOutputStore.addChangeListener(nextJobOutputStoreId, this.__handleStoreChange);
-			}
-			didChange = true;
 		}
 
 		if (didChange) {
@@ -235,6 +276,7 @@ Dashboard.Views.GithubDeploy = React.createClass({
 	},
 
 	componentWillUnmount: function () {
+		AppDeployStore.removeChangeListener(this.state.deployStoreId, this.__handleStoreChange);
 		GithubRepoStore.removeChangeListener(this.state.repoStoreId, this.__handleStoreChange);
 		if (this.state.commitStoreId) {
 			GithubCommitStore.removeChangeListener(this.state.commitStoreId, this.__handleStoreChange);
@@ -242,13 +284,18 @@ Dashboard.Views.GithubDeploy = React.createClass({
 		if (this.state.pullStoreId) {
 			GithubPullStore.removeChangeListener(this.state.pullStoreId, this.__handleStoreChange);
 		}
-		if (this.state.jobOutputStoreId) {
+		if (this.state.buildpackStoreId) {
+			BuildpackStore.removeChangeListener(this.state.buildpackStoreId, this.__handleStoreChange);
+		}
+		if (this.state.jobOutputStoreId !== null) {
 			JobOutputStore.removeChangeListener(this.state.jobOutputStoreId, this.__handleStoreChange);
 		}
 	},
 
-	__handleStoreChange: function (props) {
-		this.setState(getState(props || this.props, this.state));
+	__handleStoreChange: function (props, providerIDs) {
+		if (this.isMounted()) {
+			this.setState(getState.call(this, props || this.props, this.state, providerIDs));
+		}
 	},
 
 	__handleNameChange: function (e) {
@@ -258,11 +305,8 @@ Dashboard.Views.GithubDeploy = React.createClass({
 		});
 	},
 
-	__handleDbChange: function (e) {
-		var db = e.target.checked;
-		this.setState({
-			db: db
-		});
+	__handleProvidersChange: function (providerIDs) {
+		this.__handleStoreChange(this.props, providerIDs);
 	},
 
 	__handleEnvChange: function (env) {
@@ -271,11 +315,23 @@ Dashboard.Views.GithubDeploy = React.createClass({
 		});
 	},
 
+	__handleDeleteBtnClick: function (e) {
+		e.preventDefault();
+		Dispatcher.dispatch({
+			name: 'DELETE_APP',
+			appID: this.props.appID
+		});
+		this.setState({
+			deleting: true,
+			launchDisabled: true
+		});
+	},
+
 	__handleLaunchBtnClick: function (e) {
 		e.preventDefault();
-		var appData = Marbles.Utils.extend({
+		var appData = extend({
 			name: this.state.name,
-			dbRequested: this.state.db,
+			providerIDs: this.state.providerIDs,
 			env: this.state.env
 		}, this.props.appData || {});
 		if (this.props.errorMsg) {
@@ -286,9 +342,22 @@ Dashboard.Views.GithubDeploy = React.createClass({
 			launchDisabled: true
 		});
 		if (this.state.pull) {
-			GithubDeployActions.launchFromPull(this.state.repo, this.state.pull, appData);
+			Dispatcher.dispatch({
+				name: 'DEPLOY_APP',
+				source: 'GH_PULL',
+				repo: this.state.repo,
+				pull: this.state.pull,
+				appData: appData
+			});
 		} else {
-			GithubDeployActions.launchFromCommit(this.state.repo, this.props.branchName, this.state.commit, appData);
+			Dispatcher.dispatch({
+				name: 'DEPLOY_APP',
+				source: 'GH_COMMIT',
+				repo: this.state.repo,
+				branchName: this.props.branchName,
+				commit: this.state.commit,
+				appData: appData
+			});
 		}
 	},
 
@@ -299,4 +368,4 @@ Dashboard.Views.GithubDeploy = React.createClass({
 	}
 });
 
-})();
+export default GithubDeploy;

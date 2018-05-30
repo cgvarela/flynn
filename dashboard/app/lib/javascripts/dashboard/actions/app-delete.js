@@ -1,20 +1,13 @@
-//= require ../dispatcher
+import Dispatcher from 'dashboard/dispatcher';
+import Config from 'dashboard/config';
 
-(function () {
-
-"use strict";
-
-var Dispatcher = Dashboard.Dispatcher;
-
-Dashboard.Actions.AppDelete = {
-	deleteApp: function (appId) {
-		Dispatcher.handleViewAction({
-			name: "APP_DELETE:DELETE_APP",
-			storeId: {
-				appId: appId
-			}
-		});
-	}
+var deleteApp = function (appID) {
+	var client = Config.client;
+	client.deleteApp(appID);
 };
 
-})();
+Dispatcher.register(function (event) {
+	if (event.name === 'DELETE_APP') {
+		deleteApp(event.appID);
+	}
+});

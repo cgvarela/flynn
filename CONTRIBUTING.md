@@ -2,14 +2,12 @@
 
 We welcome and encourage community contributions to Flynn.
 
-Since the project is still unstable, there are specific priorities for development. Pull requests that do not address these priorities will not be accepted until Flynn is production ready.
-
 Please familiarize yourself with the Contribution Guidelines and Project Roadmap before contributing.
 
 There are many ways to help Flynn besides contributing code:
 
  - Fix bugs or file issues
- - Improve the [documentation](https://github.com/flynn/flynn.io) including this website
+ - Improve the [documentation](https://github.com/flynn/flynn.io)
 
 ## Contributing Code
 
@@ -26,7 +24,7 @@ Reviewers should leave a "LGTM" comment once they are satisfied with the patch. 
 Please follow these guidelines when formatting source code:
 
 * Go code should match the output of `gofmt -s`
-* Shell scripts should adhere to the [Google Shell Style guide](https://google-styleguide.googlecode.com/svn/trunk/shell.xml)
+* Shell scripts should adhere to the [Google Shell Style guide](https://google.github.io/styleguide/shell.xml)
 
 ## Developer’s Certificate of Origin
 

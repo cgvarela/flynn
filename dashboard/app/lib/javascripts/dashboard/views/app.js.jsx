@@ -1,65 +1,81 @@
-/** @jsx React.DOM */
-//= require ../stores/app
-//= require ./app-controls
-//= require ./app-source-history
-//= require ./service-unavailable
-//= require ./route-link
+import { assertEqual } from 'marbles/utils';
+import Config from '../config';
+import AppStore from '../stores/app';
+import AppSourceHistory from './app-source-history';
+import AppControls from './app-controls';
+import AppHistory from './app-history';
+import ServiceUnavailable from './service-unavailable';
 
-(function () {
+var isSystemApp = AppStore.isSystemApp;
 
-"use strict";
-
-var AppStore = Dashboard.Stores.App;
-
-var RouteLink = Dashboard.Views.RouteLink;
-
-Dashboard.Views.App = React.createClass({
+var App = React.createClass({
 	displayName: "Views.App",
 
 	render: function () {
 		var app = this.state.app;
-		var headerComponent = this.props.headerComponent || React.DOM.header;
+		var release = this.state.release;
+		var formation = this.state.formation;
+
+		if ( !app && this.state.serviceUnavailable ) {
+			return (
+				<section>
+					<section className="flex-row">
+						<ServiceUnavailable status={503} />;
+					</section>
+				</section>
+			);
+		}
+
+		if ( !app && this.state.notFound ) {
+			return (
+				<section>
+					<section className="flex-row">
+						<div>
+							<h1>Not found</h1>
+						</div>
+					</section>
+				</section>
+			);
+		}
 
 		return (
 			<section>
-				{headerComponent(this.props,
-					<RouteLink path={this.props.getClusterPath()} className="back-link">
-						Go back to cluster
-					</RouteLink>
-				)}
+				<section className="flex-row">
+					{app ? (
+						<section className="col app-controls-container">
+							<AppControls
+								headerComponent={this.props.appControlsHeaderComponent}
+								appId={this.props.appId}
+								app={app}
+								formation={formation}
+								getAppPath={this.props.getAppPath} />
+						</section>
+					) : null}
 
-				{ !app && this.state.serviceUnavailable ? (
-					<Dashboard.Views.ServiceUnavailable status={503} />
-				) : null }
+					<section className="col">
+						<section>
+							<AppHistory
+								key={this.props.appId}
+								appID={this.props.appId}
+								release={release}
+								formation={formation} />
+						</section>
 
-				{ !app && this.state.notFound ? (
-					<div>
-						<h1>Not found</h1>
-					</div>
-				) : null }
-
-				{app ? (
-					<section className="panel">
-						<Dashboard.Views.AppControls
-							headerComponent={this.props.appControlsHeaderComponent}
-							appId={this.props.appId}
-							app={app}
-							formation={this.state.formation}
-							getAppPath={this.props.getAppPath} />
+						{release && release.meta && release.meta.github === "true" && Config.githubClient ? (
+							<section>
+								<AppSourceHistory
+									appId={this.props.appId}
+									app={app}
+									release={release}
+									selectedBranchName={this.props.selectedBranchName}
+									selectedSha={this.props.selectedSha}
+									selectedTab={this.props.selectedTab}
+									getAppPath={this.props.getAppPath} />
+							</section>
+						) : null}
 					</section>
-				) : null}
+				</section>
 
-				{app && app.meta && app.meta.type === "github" ? (
-					<section className="panel">
-						<Dashboard.Views.AppSourceHistory
-							appId={this.props.appId}
-							app={app}
-							selectedBranchName={this.props.selectedBranchName}
-							selectedSha={this.props.selectedSha}
-							selectedTab={this.props.selectedTab}
-							getAppPath={this.props.getAppPath} />
-					</section>
-				) : null}
 			</section>
 		);
 	},
@@ -75,7 +91,7 @@ Dashboard.Views.App = React.createClass({
 	componentWillReceiveProps: function (nextProps) {
 		var prevAppStoreId = this.state.appStoreId;
 		var nextAppStoreId = this.__getAppStoreId(nextProps);
-		if ( !Marbles.Utils.assertEqual(prevAppStoreId, nextAppStoreId) ) {
+		if ( !assertEqual(prevAppStoreId, nextAppStoreId) ) {
 			AppStore.removeChangeListener(prevAppStoreId, this.__handleStoreChange);
 			AppStore.addChangeListener(nextAppStoreId, this.__handleStoreChange);
 			this.__handleStoreChange(nextProps);
@@ -106,9 +122,17 @@ Dashboard.Views.App = React.createClass({
 		state.notFound = appState.notFound;
 		state.app = appState.app;
 		state.formation = appState.formation;
+		state.release = appState.release;
 
 		return state;
+	},
+
+	__getClusterPathParams: function () {
+		if (this.state.app && isSystemApp(this.state.app)) {
+			return [{ system: "true" }];
+		}
+		return null;
 	}
 });
 
-})();
+export default App;

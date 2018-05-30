@@ -1,10 +1,8 @@
-/** @jsx React.DOM */
+import { extend } from 'marbles/utils';
+import { pathWithParams } from 'marbles/history';
+import Config from '../config';
 
-(function () {
-
-"use strict";
-
-Dashboard.Views.RouteLink = React.createClass({
+var RouteLink = React.createClass({
 	displayName: "Views.RouteLink",
 
 	getInitialState: function () {
@@ -21,11 +19,11 @@ Dashboard.Views.RouteLink = React.createClass({
 	},
 
 	componentWillMount: function () {
-		this.__setHrefFromPath(this.props.path);
+		this.__setHrefFromPath(this.props.path, this.props.params);
 	},
 
 	componentWillReceiveProps: function (props) {
-		this.__setHrefFromPath(props.path);
+		this.__setHrefFromPath(props.path, props.params);
 	},
 
 	handleClick: function (e) {
@@ -33,28 +31,36 @@ Dashboard.Views.RouteLink = React.createClass({
 			return;
 		}
 		e.preventDefault();
-		Marbles.history.navigate(this.props.path);
-		return false;
+		var options = {};
+		if (this.props.params) {
+			options.params = this.props.params;
+		}
+		if (Config.isNavFrozen) {
+			return;
+		}
+		Config.history.navigate(this.props.path, options);
 	},
 
-	__setHrefFromPath: function (path) {
+	__setHrefFromPath: function (path, params) {
 		var href;
-		if (Dashboard.config.PATH_PREFIX === null) {
+		path = pathWithParams(path, params || [{}]);
+		if (Config.PATH_PREFIX === null) {
 			href = path;
 		} else {
-			href = Dashboard.config.PATH_PREFIX + path;
+			href = Config.PATH_PREFIX + path;
 		}
 		this.setState({ href: href });
 	},
 
 	render: function () {
-		var props = Marbles.Utils.extend({}, this.props);
+		var props = extend({}, this.props);
 		props.href = this.state.href;
 		props.onClick = this.handleClick;
 		delete props.children;
 		delete props.path;
-		return React.DOM.a(props, this.props.children);
-	},
+		delete props.params;
+		return React.createElement('a', props, this.props.children);
+	}
 });
 
-})();
+export default RouteLink;

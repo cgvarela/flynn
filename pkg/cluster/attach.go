@@ -2,15 +2,12 @@ package cluster
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
-	"net/http/httputil"
 	"sync"
 
 	"github.com/flynn/flynn/host/types"
@@ -24,38 +21,10 @@ var ErrWouldWait = errors.New("cluster: attach would wait")
 // wait is true, the client will wait for the job to start before returning the
 // first bytes. If wait is false and the job is not running, ErrWouldWait is
 // returned.
-func (c *hostClient) Attach(req *host.AttachReq, wait bool) (AttachClient, error) {
-	data, err := json.Marshal(req)
+func (c *Host) Attach(req *host.AttachReq, wait bool) (AttachClient, error) {
+	rwc, err := c.c.Hijack("POST", "/attach", http.Header{"Upgrade": {"flynn-attach/0"}}, req)
 	if err != nil {
 		return nil, err
-	}
-	httpReq, err := http.NewRequest("POST", "/attach", bytes.NewBuffer(data))
-	if err != nil {
-		return nil, err
-	}
-	conn, err := c.dial("tcp", c.addr)
-	if err != nil {
-		return nil, err
-	}
-	clientconn := httputil.NewClientConn(conn, nil)
-	res, err := clientconn.Do(httpReq)
-	if err != nil && err != httputil.ErrPersistEOF {
-		return nil, err
-	}
-	if res.StatusCode != 200 {
-		return nil, fmt.Errorf("cluster: unexpected status %d", res.StatusCode)
-	}
-	var rwc io.ReadWriteCloser
-	var buf *bufio.Reader
-	rwc, buf = clientconn.Hijack()
-	if buf.Buffered() > 0 {
-		rwc = struct {
-			io.Reader
-			io.WriteCloser
-		}{
-			io.MultiReader(io.LimitReader(buf, int64(buf.Buffered())), rwc),
-			rwc,
-		}
 	}
 
 	attachState := make([]byte, 1)
@@ -77,7 +46,14 @@ func (c *hostClient) Attach(req *host.AttachReq, wait bool) (AttachClient, error
 			if len(errBytes) >= 4 {
 				errBytes = errBytes[4:]
 			}
-			return errors.New(string(errBytes))
+			errMsg := string(errBytes)
+			switch errMsg {
+			case host.ErrJobNotRunning.Error():
+				return host.ErrJobNotRunning
+			case host.ErrAttached.Error():
+				return host.ErrAttached
+			}
+			return errors.New(errMsg)
 		default:
 			rwc.Close()
 			return fmt.Errorf("cluster: unknown attach state: %d", attachState)
@@ -167,7 +143,8 @@ func (c *attachClient) Wait() error {
 func (c *attachClient) Receive(stdout, stderr io.Writer) (int, error) {
 	if c.wait != nil {
 		if err := c.wait(); err != nil {
-			return 0, err
+			c.mtx.Unlock()
+			return -1, err
 		}
 		c.mtx.Unlock()
 	}
@@ -179,31 +156,31 @@ func (c *attachClient) Receive(stdout, stderr io.Writer) (int, error) {
 			if err == io.EOF && stdout == nil && stderr == nil {
 				err = nil
 			}
-			return 0, err
+			return -1, err
 		}
 		switch frameType {
 		case host.AttachData:
 			stream, err := r.ReadByte()
 			if err != nil {
-				return 0, err
+				return -1, err
 			}
 			var out *io.Writer
 			switch stream {
 			case 1:
 				if stdout == nil {
-					return 0, errors.New("attach: got frame for stdout, but no writer available")
+					return -1, errors.New("attach: got frame for stdout, but no writer available")
 				}
 				out = &stdout
-			case 2:
+			case 2, 3:
 				if stderr == nil {
-					return 0, errors.New("attach: got frame for stderr, but no writer available")
+					return -1, errors.New("attach: got frame for stderr / initLog, but no writer available")
 				}
 				out = &stderr
 			default:
-				return 0, fmt.Errorf("attach: unknown stream %d", stream)
+				return -1, fmt.Errorf("attach: unknown stream %d", stream)
 			}
 			if _, err := io.ReadFull(r, buf[:]); err != nil {
-				return 0, err
+				return -1, err
 			}
 			length := int64(binary.BigEndian.Uint32(buf[:]))
 			if length == 0 {
@@ -211,13 +188,23 @@ func (c *attachClient) Receive(stdout, stderr io.Writer) (int, error) {
 				continue
 			}
 			if _, err := io.CopyN(*out, r, length); err != nil {
-				return 0, err
+				return -1, err
 			}
 		case host.AttachExit:
 			if _, err := io.ReadFull(r, buf[:]); err != nil {
-				return 0, err
+				return -1, err
 			}
 			return int(binary.BigEndian.Uint32(buf[:])), nil
+		case host.AttachError:
+			if _, err := io.ReadFull(r, buf[:]); err != nil {
+				return -1, err
+			}
+			length := int64(binary.BigEndian.Uint32(buf[:]))
+			errBytes := make([]byte, length)
+			if _, err := io.ReadFull(r, errBytes); err != nil {
+				return -1, err
+			}
+			return -1, errors.New(string(errBytes))
 		}
 	}
 }
@@ -271,7 +258,5 @@ func (c *attachClient) CloseWrite() error {
 }
 
 func (c *attachClient) Close() error {
-	c.mtx.Lock()
-	defer c.mtx.Unlock()
 	return c.conn.Close()
 }

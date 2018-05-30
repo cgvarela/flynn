@@ -1,100 +1,388 @@
 package main
 
 import (
+	"container/list"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/boltdb/bolt"
 	"github.com/flynn/flynn/host/types"
+	"github.com/flynn/flynn/pkg/cluster"
 )
 
-// TODO: prune old jobs?
+// ErrJobExists is returned when attempting to add a job to the state with an
+// ID which already exists
+var ErrJobExists = errors.New("job already exists")
+
+// maxDownJobsPerApp is the max number of done/crashed/failed jobs that will be
+// stored per app.
+var maxDownJobsPerApp = 25
+
+type ErrVolumesInUse struct {
+	volIDs []string
+}
+
+func (e ErrVolumesInUse) Error() string {
+	return fmt.Sprintf("volumes in use: %s", strings.Join(e.volIDs, ", "))
+}
 
 type State struct {
 	id string
 
-	jobs map[string]*host.ActiveJob
 	mtx  sync.RWMutex
+	jobs map[string]*host.ActiveJob
 
-	containers map[string]*host.ActiveJob              // container ID -> job
-	listeners  map[string]map[chan host.Event]struct{} // job id -> listener list (ID "all" gets all events)
-	listenMtx  sync.RWMutex
-	attachers  map[string]map[chan struct{}]struct{}
+	downJobsLRU map[string]*list.List // app ID -> down jobs list, used for garbage collection
 
-	stateFileMtx sync.Mutex
-	stateFile    *os.File
-	backend      Backend
+	listeners map[string]map[chan host.Event]struct{} // job id -> listener list (ID "all" gets all events)
+	listenMtx sync.RWMutex
+	attachers map[string]map[chan struct{}]struct{}
+
+	stateFilePath string
+	stateDB       *bolt.DB
+	dbUsers       int
+	dbCond        *sync.Cond
+
+	backend Backend
 }
 
-func NewState(id string) *State {
+func NewState(id string, stateFilePath string) *State {
 	return &State{
-		id:         id,
-		jobs:       make(map[string]*host.ActiveJob),
-		containers: make(map[string]*host.ActiveJob),
-		listeners:  make(map[string]map[chan host.Event]struct{}),
-		attachers:  make(map[string]map[chan struct{}]struct{}),
+		id:            id,
+		stateFilePath: stateFilePath,
+		jobs:          make(map[string]*host.ActiveJob),
+		downJobsLRU:   make(map[string]*list.List),
+		listeners:     make(map[string]map[chan host.Event]struct{}),
+		attachers:     make(map[string]map[chan struct{}]struct{}),
+		dbCond:        sync.NewCond(&sync.Mutex{}),
 	}
 }
 
-func (s *State) Restore(file string, backend Backend) error {
-	s.stateFileMtx.Lock()
-	defer s.stateFileMtx.Unlock()
-	f, err := os.OpenFile(file, os.O_RDWR|os.O_CREATE, 0666)
-	if err != nil {
-		return err
+/*
+	Restore prior state from the save location defined at construction time.
+	If the state save file is empty, nothing is loaded, and no error is returned.
+*/
+func (s *State) Restore(backend Backend, buffers host.LogBuffers) (func(), error) {
+	if err := s.Acquire(); err != nil {
+		return nil, err
 	}
-	s.stateFile = f
+	defer s.Release()
+
 	s.backend = backend
-	d := json.NewDecoder(f)
-	if err := d.Decode(&s.jobs); err != nil {
-		if err == io.EOF {
-			err = nil
-		}
-		return err
-	}
-	for _, job := range s.jobs {
-		if job.ContainerID != "" {
-			s.containers[job.ContainerID] = job
-		}
-	}
-	return backend.RestoreState(s.jobs, d)
-}
 
-func (s *State) persist() {
-	s.stateFileMtx.Lock()
-	defer s.stateFileMtx.Unlock()
-	if _, err := s.stateFile.Seek(0, 0); err != nil {
-		// log error
-		return
+	var resurrect []*host.Job
+	if err := s.stateDB.View(func(tx *bolt.Tx) error {
+		jobsBucket := tx.Bucket([]byte("jobs"))
+		backendJobsBucket := tx.Bucket([]byte("backend-jobs"))
+		backendGlobalBucket := tx.Bucket([]byte("backend-global"))
+		persistentBucket := tx.Bucket([]byte("persistent-jobs"))
+
+		// restore jobs
+		if err := jobsBucket.ForEach(func(k, v []byte) error {
+			job := &host.ActiveJob{}
+			if err := json.Unmarshal(v, job); err != nil {
+				return err
+			}
+			if job.CreatedAt.IsZero() {
+				job.CreatedAt = time.Now().UTC()
+			}
+			s.jobs[string(k)] = job
+
+			if statusDown(job.Status) {
+				if err := s.trackDownJob(job, tx); err != nil {
+					return err
+				}
+			}
+
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		// hand opaque blobs back to backend so it can do its restore
+		backendJobsBlobs := make(map[string][]byte)
+		if err := backendJobsBucket.ForEach(func(k, v []byte) error {
+			backendJobsBlobs[string(k)] = v
+			return nil
+		}); err != nil {
+			return err
+		}
+		backendGlobalBlob := backendGlobalBucket.Get([]byte("backend"))
+		if err := backend.UnmarshalState(s.jobs, backendJobsBlobs, backendGlobalBlob, buffers); err != nil {
+			return err
+		}
+
+		// resurrect any persistent jobs which are not running
+		if err := persistentBucket.ForEach(func(k, v []byte) error {
+			for _, job := range s.jobs {
+				if job.Job.ID == string(v) && !backend.JobExists(job.Job.ID) {
+					resurrect = append(resurrect, job.Job)
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		return nil
+	}); err != nil && err != io.EOF {
+		return nil, fmt.Errorf("could not restore from host persistence db: %s", err)
 	}
-	s.mtx.RLock()
-	defer s.mtx.RUnlock()
-	enc := json.NewEncoder(s.stateFile)
-	if err := enc.Encode(s.jobs); err != nil {
-		// log error
-		return
-	}
-	if b, ok := s.backend.(StateSaver); ok {
-		if err := b.SaveState(enc); err != nil {
-			// log error
+
+	return func() {
+		if len(resurrect) == 0 {
 			return
 		}
+		var wg sync.WaitGroup
+		wg.Add(len(resurrect))
+		for _, job := range resurrect {
+			go func(job *host.Job) {
+				// generate a new job id, this is a new job
+				newJob := job.Dup()
+				newJob.ID = cluster.GenerateJobID(s.id, "")
+				if _, ok := newJob.Config.Env["FLYNN_JOB_ID"]; ok {
+					newJob.Config.Env["FLYNN_JOB_ID"] = newJob.ID
+				}
+				log.Printf("resurrecting %s as %s", job.ID, newJob.ID)
+				s.AddJob(newJob)
+				backend.Run(newJob, nil, nil)
+				wg.Done()
+			}(job)
+		}
+		wg.Wait()
+	}, nil
+}
+
+// OpenDB opens and initialises the persistence DB, if not already open.
+func (s *State) OpenDB() error {
+	s.dbCond.L.Lock()
+	defer s.dbCond.L.Unlock()
+
+	if s.stateDB != nil {
+		return nil
 	}
-	if err := s.stateFile.Sync(); err != nil {
-		// log error
+
+	// open/initialize db
+	if err := os.MkdirAll(filepath.Dir(s.stateFilePath), 0755); err != nil {
+		return fmt.Errorf("could not not mkdir for db: %s", err)
+	}
+	stateDB, err := bolt.Open(s.stateFilePath, 0600, &bolt.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		return fmt.Errorf("could not open db: %s", err)
+	}
+	s.stateDB = stateDB
+	if err := s.stateDB.Update(func(tx *bolt.Tx) error {
+		// idempotently create buckets.  (errors ignored because they're all compile-time impossible args checks.)
+		tx.CreateBucketIfNotExists([]byte("jobs"))
+		tx.CreateBucketIfNotExists([]byte("gc-jobs"))
+		tx.CreateBucketIfNotExists([]byte("backend-jobs"))
+		tx.CreateBucketIfNotExists([]byte("backend-global"))
+		tx.CreateBucketIfNotExists([]byte("persistent-jobs"))
+		return nil
+	}); err != nil {
+		return fmt.Errorf("could not initialize host persistence db: %s", err)
+	}
+	return nil
+}
+
+// CloseDB closes the persistence DB, waiting for the state to be fully
+// released first.
+func (s *State) CloseDB() error {
+	s.dbCond.L.Lock()
+	defer s.dbCond.L.Unlock()
+	if s.stateDB == nil {
+		return nil
+	}
+	for s.dbUsers > 0 {
+		s.dbCond.Wait()
+	}
+	if err := s.stateDB.Close(); err != nil {
+		return err
+	}
+	s.stateDB = nil
+	return nil
+}
+
+var ErrDBClosed = errors.New("state DB closed")
+
+// Acquire acquires the state for use by incrementing s.dbUsers, which prevents
+// the state DB being closed until the caller has finished performing actions
+// which will lead to changes being persisted to the DB.
+//
+// For example, running a job starts the job and then persists the change of
+// state, but if the DB is closed in that time then the state of the running
+// job will be lost.
+//
+// ErrDBClosed is returned if the DB is already closed so API requests will
+// fail before any actions are performed.
+func (s *State) Acquire() error {
+	s.dbCond.L.Lock()
+	defer s.dbCond.L.Unlock()
+	if s.stateDB == nil {
+		return ErrDBClosed
+	}
+	s.dbUsers++
+	return nil
+}
+
+// Release releases the state by decrementing s.dbUsers, broadcasting the
+// condition variable if no users are left to wake CloseDB.
+func (s *State) Release() {
+	s.dbCond.L.Lock()
+	defer s.dbCond.L.Unlock()
+	s.dbUsers--
+	if s.dbUsers == 0 {
+		s.dbCond.Broadcast()
 	}
 }
 
-func (s *State) AddJob(j *host.Job) {
+func (s *State) PersistBackendGlobalState(data []byte) error {
+	return s.stateDB.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("backend-global")).Put([]byte("backend"), data)
+	})
+}
+
+func (s *State) pruneDownJobs(tx *bolt.Tx, downJobs *list.List) error {
+	for downJobs.Len() > maxDownJobsPerApp {
+		el := downJobs.Back()
+		jobID := el.Value.(string)
+		job, ok := s.jobs[jobID]
+		if ok {
+			b, err := json.Marshal(job)
+			if err != nil {
+				return err
+			}
+			tx.Bucket([]byte("gc-jobs")).Put([]byte(jobID), b)
+		}
+		tx.Bucket([]byte("jobs")).Delete([]byte(jobID))
+		delete(s.jobs, jobID)
+		downJobs.Remove(el)
+	}
+	return nil
+}
+
+func (s *State) trackDownJob(job *host.ActiveJob, tx *bolt.Tx) error {
+	app := job.Job.Config.Env["FLYNN_APP_ID"]
+	l, ok := s.downJobsLRU[app]
+	if !ok {
+		l = list.New()
+		s.downJobsLRU[app] = l
+	}
+	l.PushFront(job.Job.ID)
+	if l.Len() > maxDownJobsPerApp {
+		if err := s.pruneDownJobs(tx, l); err != nil {
+			return fmt.Errorf("failed to prune down jobs: %s", err)
+		}
+	}
+	return nil
+}
+
+func (s *State) persist(jobID string) {
+	// s.mtx.RLock() should already be covered by caller
+
+	if err := s.stateDB.Update(func(tx *bolt.Tx) error {
+		jobsBucket := tx.Bucket([]byte("jobs"))
+		backendJobsBucket := tx.Bucket([]byte("backend-jobs"))
+		backendGlobalBucket := tx.Bucket([]byte("backend-global"))
+
+		// serialize the changed job, and push it into jobs bucket
+		if job, exists := s.jobs[jobID]; exists {
+			if statusDown(job.Status) {
+				if err := s.trackDownJob(job, tx); err != nil {
+					return err
+				}
+			}
+			b, err := json.Marshal(s.jobs[jobID])
+			if err != nil {
+				return fmt.Errorf("failed to serialize job state: %s", err)
+			}
+			err = jobsBucket.Put([]byte(jobID), b)
+			if err != nil {
+				return fmt.Errorf("could not persist job to boltdb: %s", err)
+			}
+		}
+
+		// save the opaque blob the backend provides regarding this job if it is starting/running
+		if backend, ok := s.backend.(JobStateSaver); ok {
+			if job, exists := s.jobs[jobID]; exists && (job.Status == host.StatusStarting || job.Status == host.StatusRunning) {
+				backendState, err := backend.MarshalJobState(jobID)
+				if err != nil {
+					return fmt.Errorf("backend failed to serialize job state: %s", err)
+				}
+				if backendState == nil {
+					backendJobsBucket.Delete([]byte(jobID))
+				} else {
+					err = backendJobsBucket.Put([]byte(jobID), backendState)
+					if err != nil {
+						return fmt.Errorf("could not persist backend job state to boltdb: %s", err)
+					}
+				}
+			} else {
+				backendJobsBucket.Delete([]byte(jobID))
+			}
+		}
+
+		// (re)save any state the backend provides that isn't tied to specific jobs.
+		if backend, ok := s.backend.(StateSaver); ok {
+			bytes, err := backend.MarshalGlobalState()
+			if err != nil {
+				return fmt.Errorf("backend failed to serialize global state: %s", err)
+			}
+			err = backendGlobalBucket.Put([]byte("backend"), bytes)
+			if err != nil {
+				return fmt.Errorf("could not persist backend global state to boltdb: %s", err)
+			}
+		}
+
+		return nil
+	}); err != nil {
+		panic(fmt.Errorf("could not persist to boltdb: %s", err))
+	}
+}
+
+func (s *State) AddJob(j *host.Job) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
-	job := &host.ActiveJob{Job: j, HostID: s.id}
+	if _, ok := s.jobs[j.ID]; ok {
+		return ErrJobExists
+	}
+
+	// ensure none of the volumes are in use by running jobs
+	var volsInUse []string
+	for _, vol := range j.Config.Volumes {
+		for _, job := range s.jobs {
+			if job.Status != host.StatusStarting && job.Status != host.StatusRunning {
+				continue
+			}
+			for _, v := range job.Job.Config.Volumes {
+				if v.VolumeID == vol.VolumeID {
+					volsInUse = append(volsInUse, vol.VolumeID)
+				}
+			}
+		}
+	}
+	if len(volsInUse) > 0 {
+		return ErrVolumesInUse{volsInUse}
+	}
+
+	job := &host.ActiveJob{
+		Job:       j,
+		HostID:    s.id,
+		CreatedAt: time.Now().UTC(),
+	}
 	s.jobs[j.ID] = job
-	s.sendEvent(job, "create")
-	go s.persist()
+	s.sendEvent(job, host.JobEventCreate)
+	s.persist(j.ID)
+	return nil
 }
 
 func (s *State) GetJob(id string) *host.ActiveJob {
@@ -102,25 +390,42 @@ func (s *State) GetJob(id string) *host.ActiveJob {
 	defer s.mtx.RUnlock()
 	job := s.jobs[id]
 	if job == nil {
-		return nil
+		// check if job has been GC'ed
+		s.stateDB.View(func(tx *bolt.Tx) error {
+			jobData := tx.Bucket([]byte("gc-jobs")).Get([]byte(id))
+			if len(jobData) == 0 {
+				return nil
+			}
+			job = &host.ActiveJob{}
+			if err := json.Unmarshal(jobData, job); err != nil {
+				log.Printf("error unmarshalling GCed job %s: %s", id, err)
+				job = nil
+			}
+			return nil
+		})
+		return job
 	}
-	jobCopy := *job
-	return &jobCopy
+	return job.Dup()
 }
 
-func (s *State) RemoveJob(id string) {
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-	delete(s.jobs, id)
-	go s.persist()
-}
-
-func (s *State) Get() map[string]host.ActiveJob {
+func (s *State) Get() map[string]*host.ActiveJob {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
-	res := make(map[string]host.ActiveJob, len(s.jobs))
+	res := make(map[string]*host.ActiveJob, len(s.jobs))
 	for k, v := range s.jobs {
-		res[k] = *v
+		res[k] = v.Dup()
+	}
+	return res
+}
+
+func (s *State) GetActive() map[string]*host.ActiveJob {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	res := make(map[string]*host.ActiveJob)
+	for id, job := range s.jobs {
+		if job.Status == host.StatusStarting || job.Status == host.StatusRunning {
+			res[id] = job.Dup()
+		}
 	}
 	return res
 }
@@ -136,26 +441,31 @@ func (s *State) ClusterJobs() []*host.Job {
 	return res
 }
 
-func (s *State) SetContainerID(jobID, containerID string) {
+func (s *State) SetContainerIP(jobID string, ip net.IP) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
-	s.jobs[jobID].ContainerID = containerID
-	s.containers[containerID] = s.jobs[jobID]
-	go s.persist()
+	s.jobs[jobID].InternalIP = ip.String()
+	s.persist(jobID)
 }
 
-func (s *State) SetInternalIP(jobID, ip string) {
+func (s *State) SetContainerPID(jobID string, pid int) {
 	s.mtx.Lock()
-	s.jobs[jobID].InternalIP = ip
-	s.mtx.Unlock()
-	go s.persist()
+	defer s.mtx.Unlock()
+	s.jobs[jobID].PID = &pid
+	s.persist(jobID)
 }
 
-func (s *State) SetManifestID(jobID, manifestID string) {
+func (s *State) SetForceStop(jobID string) {
 	s.mtx.Lock()
-	s.jobs[jobID].ManifestID = manifestID
-	s.mtx.Unlock()
-	go s.persist()
+	defer s.mtx.Unlock()
+
+	job, ok := s.jobs[jobID]
+	if !ok {
+		return
+	}
+
+	job.ForceStop = true
+	s.persist(jobID)
 }
 
 func (s *State) SetStatusRunning(jobID string) {
@@ -169,44 +479,36 @@ func (s *State) SetStatusRunning(jobID string) {
 
 	job.StartedAt = time.Now().UTC()
 	job.Status = host.StatusRunning
-	s.sendEvent(job, "start")
-	go s.persist()
-}
-
-func (s *State) SetContainerStatusDone(containerID string, exitCode int) {
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-	job, ok := s.containers[containerID]
-	if !ok {
-		return
+	s.sendEvent(job, host.JobEventStart)
+	if err := s.Acquire(); err == nil {
+		s.persist(jobID)
+		s.Release()
 	}
-	s.setStatusDone(job, exitCode)
 }
 
-func (s *State) SetStatusDone(jobID string, exitCode int) {
+func (s *State) SetStatusDone(jobID string, exitStatus int) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 	job, ok := s.jobs[jobID]
 	if !ok {
-		fmt.Println("SKIP")
 		return
 	}
-	s.setStatusDone(job, exitCode)
-}
-
-func (s *State) setStatusDone(job *host.ActiveJob, exitStatus int) {
 	if job.Status == host.StatusDone || job.Status == host.StatusCrashed || job.Status == host.StatusFailed {
 		return
 	}
 	job.EndedAt = time.Now().UTC()
-	job.ExitStatus = exitStatus
+	job.ExitStatus = &exitStatus
 	if exitStatus == 0 {
 		job.Status = host.StatusDone
 	} else {
 		job.Status = host.StatusCrashed
 	}
-	s.sendEvent(job, "stop")
-	go s.persist()
+	job.PID = nil
+	s.sendEvent(job, host.JobEventStop)
+	if err := s.Acquire(); err == nil {
+		s.persist(job.Job.ID)
+		s.Release()
+	}
 }
 
 func (s *State) SetStatusFailed(jobID string, err error) {
@@ -221,8 +523,12 @@ func (s *State) SetStatusFailed(jobID string, err error) {
 	job.EndedAt = time.Now().UTC()
 	errStr := err.Error()
 	job.Error = &errStr
-	s.sendEvent(job, "error")
-	go s.persist()
+	job.PID = nil
+	s.sendEvent(job, host.JobEventError)
+	if err := s.Acquire(); err == nil {
+		s.persist(jobID)
+		s.Release()
+	}
 	go s.WaitAttach(jobID)
 }
 
@@ -278,7 +584,7 @@ func (s *State) AddListener(jobID string) chan host.Event {
 func (s *State) RemoveListener(jobID string, ch chan host.Event) {
 	go func() {
 		// drain to prevent deadlock while removing the listener
-		for _ = range ch {
+		for range ch {
 		}
 	}()
 	s.listenMtx.Lock()
@@ -290,12 +596,20 @@ func (s *State) RemoveListener(jobID string, ch chan host.Event) {
 	close(ch)
 }
 
-func (s *State) sendEvent(job *host.ActiveJob, event string) {
-	j := *job
+func (s *State) SendCleanupEvent(jobID string) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	if job, ok := s.jobs[jobID]; ok {
+		s.sendEvent(job, host.JobEventCleanup)
+	}
+}
+
+func (s *State) sendEvent(job *host.ActiveJob, event host.JobEventType) {
+	j := job.Dup()
 	go func() {
 		s.listenMtx.RLock()
 		defer s.listenMtx.RUnlock()
-		e := host.Event{JobID: job.Job.ID, Job: &j, Event: event}
+		e := host.Event{JobID: job.Job.ID, Job: j, Event: event}
 		for ch := range s.listeners["all"] {
 			ch <- e
 		}
@@ -303,4 +617,19 @@ func (s *State) sendEvent(job *host.ActiveJob, event string) {
 			ch <- e
 		}
 	}()
+}
+
+func (s *State) SetPersistentSlot(slot string, jobID string) error {
+	if err := s.Acquire(); err != nil {
+		return err
+	}
+	defer s.Release()
+	return s.stateDB.Update(func(tx *bolt.Tx) error {
+		persistentBucket := tx.Bucket([]byte("persistent-jobs"))
+		return persistentBucket.Put([]byte(slot), []byte(jobID))
+	})
+}
+
+func statusDown(s host.JobStatus) bool {
+	return s == host.StatusDone || s == host.StatusCrashed || s == host.StatusFailed
 }

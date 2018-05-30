@@ -2,24 +2,81 @@ package config
 
 import (
 	"bytes"
+	"encoding/base64"
+	"errors"
 	"fmt"
-	"net"
 	"net/url"
 	"os"
+	"path/filepath"
+	"runtime"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/BurntSushi/toml"
+	"github.com/BurntSushi/toml"
+	"github.com/flynn/flynn/controller/client"
+	"github.com/mitchellh/go-homedir"
 )
 
+var ErrNoDockerPushURL = errors.New("ERROR: Docker push URL not configured, set it with 'flynn docker set-push-url'")
+
 type Cluster struct {
-	Name    string `json:"name"`
-	GitHost string `json:"git_host"`
-	URL     string `json:"url"`
-	Key     string `json:"key"`
-	TLSPin  string `json:"tls_pin"`
+	Name          string `json:"name"`
+	Key           string `json:"key"`
+	TLSPin        string `json:"tls_pin" toml:"TLSPin,omitempty"`
+	ControllerURL string `json:"controller_url"`
+	GitURL        string `json:"git_url"`
+	DockerPushURL string `json:"docker_push_url"`
+}
+
+func (c *Cluster) Client() (controller.Client, error) {
+	var pin []byte
+	if c.TLSPin != "" {
+		var err error
+		pin, err = base64.StdEncoding.DecodeString(c.TLSPin)
+		if err != nil {
+			return nil, fmt.Errorf("error decoding tls pin: %s", err)
+		}
+	}
+	return controller.NewClientWithConfig(c.ControllerURL, c.Key, controller.Config{Pin: pin})
+}
+
+func (c *Cluster) DockerPushHost() (string, error) {
+	if c.DockerPushURL == "" {
+		return "", ErrNoDockerPushURL
+	}
+	u, err := url.Parse(c.DockerPushURL)
+	if err != nil {
+		return "", fmt.Errorf("cluster: could not parse DockerPushURL: %s", err)
+	}
+	return u.Host, nil
 }
 
 type Config struct {
+	Default  string     `toml:"default"`
 	Clusters []*Cluster `toml:"cluster"`
+}
+
+func HomeDir() string {
+	dir, err := homedir.Dir()
+	if err != nil {
+		panic(err)
+	}
+	return dir
+}
+
+func Dir() string {
+	if runtime.GOOS == "windows" {
+		return filepath.Join(os.Getenv("APPDATA"), "flynn")
+	}
+	return filepath.Join(HomeDir(), ".flynn")
+}
+
+func DefaultPath() string {
+	if p := os.Getenv("FLYNNRC"); p != "" {
+		return p
+	}
+	if runtime.GOOS == "windows" {
+		return filepath.Join(Dir(), "flynnrc")
+	}
+	return filepath.Join(HomeDir(), ".flynnrc")
 }
 
 func ReadFile(path string) (*Config, error) {
@@ -39,41 +96,67 @@ func (c *Config) Marshal() []byte {
 	return buf.Bytes()
 }
 
-func (c *Config) Add(s *Cluster) error {
-	if s.GitHost == "" {
-		u, err := url.Parse(s.URL)
-		if err != nil {
-			return err
+func (c *Config) Add(s *Cluster, force bool) error {
+	var msg string
+	conflictIdx := -1
+	for i, existing := range c.Clusters {
+		var m string
+		switch {
+		case existing.Name == s.Name:
+			m = fmt.Sprintf("Cluster %q already exists in ~/.flynnrc", s.Name)
+		case existing.GitURL != "" && existing.GitURL == s.GitURL:
+			m = fmt.Sprintf("A cluster with the URL %q already exists in ~/.flynnrc", s.GitURL)
+		case existing.ControllerURL == s.ControllerURL:
+			m = fmt.Sprintf("A cluster with the URL %q already exists in ~/.flynnrc", s.ControllerURL)
+		case existing.DockerPushURL != "" && existing.DockerPushURL == s.DockerPushURL:
+			m = fmt.Sprintf("A cluster with the URL %q already exists in ~/.flynnrc", s.DockerPushURL)
 		}
-		if host, _, err := net.SplitHostPort(u.Host); err == nil {
-			s.GitHost = host
-		} else {
-			s.GitHost = u.Host
+		if m != "" {
+			if conflictIdx != -1 && conflictIdx != i {
+				return fmt.Errorf("The cluster name and/or URLs conflict with multiple existing clusters.")
+			}
+			conflictIdx = i
+			msg = m
 		}
 	}
 
-	for _, existing := range c.Clusters {
-		if existing.Name == s.Name {
-			return fmt.Errorf("Cluster %q already exists in ~/.flynnrc", s.Name)
+	// The new cluster config conflicts with an existing one
+	if msg != "" {
+		if !force {
+			return fmt.Errorf(msg)
 		}
-		if existing.URL == s.URL {
-			return fmt.Errorf("A cluster with the URL %q already exists in ~/.flynnrc", s.URL)
-		}
-		if existing.GitHost == s.GitHost {
-			return fmt.Errorf("A cluster with the git host %q already exists in ~/.flynnrc", s.GitHost)
-		}
+
+		// Remove conflicting cluster
+		c.Clusters = append(c.Clusters[:conflictIdx], c.Clusters[conflictIdx+1:]...)
 	}
 
 	c.Clusters = append(c.Clusters, s)
+
 	return nil
 }
 
-func (c *Config) Remove(name string) bool {
+func (c *Config) Upgrade() (changed bool) {
+	// Any "config migrations" should be done in this function
+	return false
+}
+
+func (c *Config) Remove(name string) *Cluster {
 	for i, s := range c.Clusters {
 		if s.Name != name {
 			continue
 		}
 		c.Clusters = append(c.Clusters[:i], c.Clusters[i+1:]...)
+		return s
+	}
+	return nil
+}
+
+func (c *Config) SetDefault(name string) bool {
+	for _, s := range c.Clusters {
+		if s.Name != name {
+			continue
+		}
+		c.Default = name
 		return true
 	}
 	return false

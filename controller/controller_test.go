@@ -1,146 +1,113 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-sql"
-	_ "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/pq"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/go-martini/martini"
-	. "github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/check.v1"
+	"github.com/flynn/flynn/controller/client"
+	"github.com/flynn/flynn/controller/schema"
 	tu "github.com/flynn/flynn/controller/testutils"
 	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/flynn/controller/utils"
+	"github.com/flynn/flynn/pkg/certgen"
+	hh "github.com/flynn/flynn/pkg/httphelper"
+	"github.com/flynn/flynn/pkg/postgres"
 	"github.com/flynn/flynn/pkg/random"
-	"github.com/flynn/flynn/pkg/rpcplus"
+	"github.com/flynn/flynn/pkg/testutils/postgres"
+	"github.com/flynn/flynn/pkg/typeconv"
+	. "github.com/flynn/go-check"
+	"github.com/jackc/pgx"
+	"github.com/tent/canonical-json-go"
 )
+
+func init() {
+	schemaRoot, _ = filepath.Abs(filepath.Join("..", "schema"))
+}
 
 // Hook gocheck up to the "go test" runner
 func Test(t *testing.T) { TestingT(t) }
 
 type S struct {
-	cc  *tu.FakeCluster
-	srv *httptest.Server
-	m   *martini.Martini
+	cc     *tu.FakeCluster
+	srv    *httptest.Server
+	hc     handlerConfig
+	c      controller.Client
+	flac   *fakeLogAggregatorClient
+	caCert []byte
 }
 
 var _ = Suite(&S{})
 
-func (s *S) SetUpSuite(c *C) {
-	dbname := "controllertest"
-	if os.Getenv("PGDATABASE") != "" {
-		dbname = os.Getenv("PGDATABASE")
-	} else {
-		os.Setenv("PGDATABASE", dbname)
-	}
-	if os.Getenv("PGSSLMODE") == "" {
-		os.Setenv("PGSSLMODE", "disable")
-	}
-
-	db, err := sql.Open("postgres", "dbname=postgres")
-	if err != nil {
-		c.Fatal(err)
-	}
-	if _, err := db.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS %s", dbname)); err != nil {
-		c.Fatal(err)
-	}
-	if _, err := db.Exec(fmt.Sprintf("CREATE DATABASE %s", dbname)); err != nil {
-		c.Fatal(err)
-	}
-	db.Close()
-
-	dsn := fmt.Sprintf("dbname=%s", dbname)
-	db, err = sql.Open("postgres", dsn)
-	if err != nil {
-		c.Fatal(err)
-	}
-	if err = migrateDB(db); err != nil {
-		c.Fatal(err)
-	}
-	dbw := testDBWrapper{DB: db, dsn: dsn}
-
-	s.cc = tu.NewFakeCluster()
-	handler, m := appHandler(handlerConfig{db: dbw, cc: s.cc, sc: newFakeRouter(), key: "test"})
-	s.m = m
-	s.srv = httptest.NewServer(handler)
-}
-
-type testDBWrapper struct {
-	*sql.DB
-	dsn string
-}
-
-func (w testDBWrapper) DSN() string       { return w.dsn }
-func (w testDBWrapper) Database() *sql.DB { return w.DB }
-
 var authKey = "test"
 
-func (s *S) send(method, path string, in, out interface{}) (*http.Response, error) {
-	buf, err := json.Marshal(in)
+func setupTestDB(c *C, dbname string) *postgres.DB {
+	if err := pgtestutils.SetupPostgres(dbname); err != nil {
+		c.Fatal(err)
+	}
+	pgxpool, err := pgx.NewConnPool(pgx.ConnPoolConfig{
+		ConnConfig: pgx.ConnConfig{
+			Host:     os.Getenv("PGHOST"),
+			Database: dbname,
+		},
+	})
 	if err != nil {
-		return nil, err
+		c.Fatal(err)
 	}
-	req, err := http.NewRequest(method, s.srv.URL+path, bytes.NewBuffer(buf))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.SetBasicAuth("", authKey)
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	if out != nil && res.StatusCode == 200 {
-		defer res.Body.Close()
-		return res, json.NewDecoder(res.Body).Decode(out)
-	}
-	return res, nil
+	return postgres.New(pgxpool, nil)
 }
 
-func (s *S) body(res *http.Response) (string, error) {
-	defer res.Body.Close()
-	buf, err := ioutil.ReadAll(res.Body)
+func (s *S) SetUpSuite(c *C) {
+	dbname := "controllertest"
+	db := setupTestDB(c, dbname)
+	if err := migrateDB(db); err != nil {
+		c.Fatal(err)
+	}
+
+	// reconnect with que statements prepared now that schema is migrated
+
+	pgxpool, err := pgx.NewConnPool(pgx.ConnPoolConfig{
+		ConnConfig: pgx.ConnConfig{
+			Host:     "/var/run/postgresql",
+			Database: dbname,
+		},
+		AfterConnect: schema.PrepareStatements,
+	})
 	if err != nil {
-		return "", err
+		c.Fatal(err)
 	}
-	return string(buf), nil
-}
+	db = postgres.New(pgxpool, nil)
 
-func (s *S) Post(path string, in, out interface{}) (*http.Response, error) {
-	return s.send("POST", path, in, out)
-}
-
-func (s *S) Put(path string, in, out interface{}) (*http.Response, error) {
-	return s.send("PUT", path, in, out)
-}
-
-func (s *S) Get(path string, data interface{}) (*http.Response, error) {
-	req, err := http.NewRequest("GET", s.srv.URL+path, nil)
+	ca, err := certgen.Generate(certgen.Params{IsCA: true})
 	if err != nil {
-		return nil, err
+		c.Fatal(err)
 	}
-	req.SetBasicAuth("", authKey)
-	res, err := http.DefaultClient.Do(req)
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		return res, fmt.Errorf("Unexpected status code %d", res.StatusCode)
+	s.caCert = []byte(ca.PEM)
+
+	s.flac = newFakeLogAggregatorClient()
+	s.cc = tu.NewFakeCluster()
+	s.hc = handlerConfig{
+		db:     db,
+		cc:     s.cc,
+		lc:     s.flac,
+		rc:     newFakeRouter(),
+		keys:   []string{authKey},
+		caCert: s.caCert,
 	}
-	return res, json.NewDecoder(res.Body).Decode(data)
+	handler := appHandler(s.hc)
+	s.srv = httptest.NewServer(handler)
+	client, err := controller.NewClient(s.srv.URL, authKey)
+	c.Assert(err, IsNil)
+	s.c = client
 }
 
-func (s *S) Delete(path string) (*http.Response, error) {
-	req, err := http.NewRequest("DELETE", s.srv.URL+path, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.SetBasicAuth("", authKey)
-	return http.DefaultClient.Do(req)
+func (s *S) SetUpTest(c *C) {
+	s.cc.SetHosts(make(map[string]utils.HostClient))
 }
 
 func (s *S) TestBadAuth(c *C) {
@@ -156,465 +123,525 @@ func (s *S) TestBadAuth(c *C) {
 	c.Assert(err, IsNil)
 	res.Body.Close()
 	c.Assert(res.StatusCode, Equals, 401)
-
-	_, err = rpcplus.DialHTTP("tcp", s.srv.Listener.Addr().String())
-	c.Assert(err, Not(IsNil))
 }
 
 func (s *S) createTestApp(c *C, in *ct.App) *ct.App {
-	out := &ct.App{}
-	res, err := s.Post("/apps", in, out)
-	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
-	return out
+	c.Assert(s.c.CreateApp(in), IsNil)
+	return in
 }
 
 func (s *S) TestCreateApp(c *C) {
 	for _, id := range []string{"", random.UUID()} {
-		app := s.createTestApp(c, &ct.App{ID: id, Protected: true, Meta: map[string]string{"foo": "bar"}})
+		app := s.createTestApp(c, &ct.App{ID: id, Meta: map[string]string{"foo": "bar"}})
 		c.Assert(app.Name, Not(Equals), "")
 		c.Assert(app.ID, Not(Equals), "")
 		if id != "" {
 			c.Assert(app.ID, Equals, id)
 		}
-		c.Assert(app.Protected, Equals, true)
 		c.Assert(app.Meta["foo"], Equals, "bar")
 
-		gotApp := &ct.App{}
-		res, err := s.Get("/apps/"+app.ID, gotApp)
+		gotApp, err := s.c.GetApp(app.ID)
 		c.Assert(err, IsNil)
 		c.Assert(gotApp, DeepEquals, app)
 
-		res, err = s.Get("/apps/"+app.Name, gotApp)
+		gotApp, err = s.c.GetApp(app.Name)
 		c.Assert(err, IsNil)
 		c.Assert(gotApp, DeepEquals, app)
 
-		res, err = s.Get("/apps/fail"+app.ID, gotApp)
-		c.Assert(res.StatusCode, Equals, 404)
+		_, err = s.c.GetApp("fail" + app.ID)
+		c.Assert(err, Equals, controller.ErrNotFound)
 	}
+}
+
+func (s *S) TestCreateAppDefaultGC(c *C) {
+	type meta struct {
+		in  map[string]string
+		out map[string]string
+	}
+	for _, m := range []meta{
+		{
+			in:  nil,
+			out: map[string]string{"gc.max_inactive_slug_releases": "10"},
+		},
+		{
+			in:  map[string]string{},
+			out: map[string]string{"gc.max_inactive_slug_releases": "10"},
+		},
+		{
+			in:  map[string]string{"gc.max_inactive_slug_releases": "20"},
+			out: map[string]string{"gc.max_inactive_slug_releases": "20"},
+		},
+		{
+			in:  map[string]string{"foo": "bar"},
+			out: map[string]string{"foo": "bar", "gc.max_inactive_slug_releases": "10"},
+		},
+		{
+			in:  map[string]string{"foo": "bar", "gc.max_inactive_slug_releases": "20"},
+			out: map[string]string{"foo": "bar", "gc.max_inactive_slug_releases": "20"},
+		},
+	} {
+		app := s.createTestApp(c, &ct.App{Meta: m.in})
+		c.Assert(app.Meta, DeepEquals, m.out)
+		app, err := s.c.GetApp(app.ID)
+		c.Assert(err, IsNil)
+		c.Assert(app.Meta, DeepEquals, m.out)
+	}
+}
+
+func (s *S) TestSystemApp(c *C) {
+	app := s.createTestApp(c, &ct.App{Meta: map[string]string{"flynn-system-app": "true"}})
+	c.Assert(app.System(), Equals, true)
+
+	app.Meta["flynn-system-app"] = "false"
+	c.Assert(s.c.UpdateApp(app), IsNil)
+	c.Assert(app.System(), Equals, false)
+
+	delete(app.Meta, "flynn-system-app")
+	c.Assert(s.c.UpdateApp(app), IsNil)
+	c.Assert(app.System(), Equals, false)
 }
 
 func (s *S) TestUpdateApp(c *C) {
 	meta := map[string]string{"foo": "bar"}
 	app := s.createTestApp(c, &ct.App{Name: "update-app", Meta: meta})
-	c.Assert(app.Protected, Equals, false)
 	c.Assert(app.Meta, DeepEquals, meta)
 
-	gotApp := &ct.App{}
-	res, err := s.Post("/apps/"+app.Name, map[string]bool{"protected": true}, gotApp)
-	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
-	c.Assert(gotApp.Protected, Equals, true)
-	c.Assert(gotApp.Meta, DeepEquals, meta)
-
+	app = &ct.App{ID: app.ID}
 	meta = map[string]string{"foo": "baz", "bar": "foo"}
-	res, err = s.Post("/apps/"+app.ID, map[string]interface{}{"protected": false, "meta": meta}, gotApp)
+	app.Meta = meta
+	c.Assert(s.c.UpdateApp(app), IsNil)
+	c.Assert(app.Meta, DeepEquals, meta)
+
+	app, err := s.c.GetApp(app.ID)
 	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
-	c.Assert(gotApp.Protected, Equals, false)
-	c.Assert(gotApp.Meta, DeepEquals, meta)
+	c.Assert(app.Meta, DeepEquals, meta)
 
-	res, err = s.Get("/apps/"+app.ID, gotApp)
+	app.Meta = nil
+	strategy := "one-by-one"
+	app.Strategy = strategy
+	c.Assert(s.c.UpdateApp(app), IsNil)
+	c.Assert(app.Meta, DeepEquals, meta)
+	c.Assert(app.Strategy, Equals, strategy)
+
+	app, err = s.c.GetApp(app.ID)
 	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
-	c.Assert(gotApp.Protected, Equals, false)
-	c.Assert(gotApp.Meta, DeepEquals, meta)
-}
+	c.Assert(app.Meta, DeepEquals, meta)
+	c.Assert(app.Strategy, Equals, strategy)
 
-func (s *S) TestDeleteApp(c *C) {
-	for i, useName := range []bool{false, true} {
-		app := s.createTestApp(c, &ct.App{Name: fmt.Sprintf("delete-app-%d", i)})
-
-		var path string
-		if useName {
-			path = "/apps/" + app.Name
-		} else {
-			path = "/apps/" + app.ID
-		}
-		res, err := s.Delete(path)
-		c.Assert(err, IsNil)
-		c.Assert(res.StatusCode, Equals, 200)
-
-		res, err = s.Get(path, app)
-		c.Assert(res.StatusCode, Equals, 404)
+	timeout := int32(150)
+	app = &ct.App{
+		ID:            app.ID,
+		DeployTimeout: timeout,
 	}
+	c.Assert(s.c.UpdateApp(app), IsNil)
+	c.Assert(app.Meta, DeepEquals, meta)
+	c.Assert(app.Strategy, Equals, strategy)
+	c.Assert(app.DeployTimeout, Equals, timeout)
+
+	app, err = s.c.GetApp(app.ID)
+	c.Assert(err, IsNil)
+	c.Assert(app.Meta, DeepEquals, meta)
+	c.Assert(app.Strategy, Equals, strategy)
+	c.Assert(app.DeployTimeout, Equals, timeout)
 }
 
-func (s *S) TestRecreateApp(c *C) {
-	app := s.createTestApp(c, &ct.App{Name: "recreate-app"})
+func (s *S) TestUpdateAppMeta(c *C) {
+	meta := map[string]string{"foo": "bar"}
+	app := s.createTestApp(c, &ct.App{Name: "update-app-meta", Meta: meta})
+	c.Assert(app.Meta, DeepEquals, meta)
 
-	// Post a duplicate
-	res, err := s.Post("/apps", app, &ct.App{})
+	app = &ct.App{ID: app.ID}
+	meta = map[string]string{"foo": "baz", "bar": "foo"}
+	app.Meta = meta
+	c.Assert(s.c.UpdateAppMeta(app), IsNil)
+	c.Assert(app.Meta, DeepEquals, meta)
+
+	app = &ct.App{ID: app.ID}
+	meta = map[string]string{}
+	app.Meta = meta
+	c.Assert(s.c.UpdateAppMeta(app), IsNil)
+	c.Assert(app.Meta, DeepEquals, meta)
+
+	app, err := s.c.GetApp(app.ID)
 	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 500) // TODO: This should probably be a 4xx error
-
-	// Delete the original
-	path := "/apps/" + app.ID
-	res, err = s.Delete(path)
-	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
-
-	// Create the same key
-	app = s.createTestApp(c, &ct.App{Name: "recreate-app"})
-	c.Assert(app.Name, Equals, "recreate-app")
-}
-
-func (s *S) TestProtectedApp(c *C) {
-	app := s.createTestApp(c, &ct.App{Name: "protected-app", Protected: true})
-	release := s.createTestRelease(c, &ct.Release{
-		Processes: map[string]ct.ProcessType{"web": {}, "worker": {}},
-	})
-
-	path := formationPath(app.ID, release.ID)
-	for _, t := range []struct {
-		procs  map[string]int
-		status int
-	}{
-		{nil, 400},
-		{map[string]int{"web": 1}, 400},
-		{map[string]int{"worker": 1, "web": 0}, 400},
-		{map[string]int{"worker": 1, "web": 1}, 200},
-	} {
-		res, err := s.Put(path, &ct.Formation{Processes: t.procs}, nil)
-		c.Assert(err, IsNil)
-		res.Body.Close()
-		c.Assert(res.StatusCode, Equals, t.status)
-	}
+	c.Assert(app.Meta, DeepEquals, meta)
 }
 
 func (s *S) createTestArtifact(c *C, in *ct.Artifact) *ct.Artifact {
-	out := &ct.Artifact{}
-	res, err := s.Post("/artifacts", in, out)
-	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
-	return out
+	if in.Type == "" {
+		in.Type = ct.ArtifactTypeFlynn
+		in.RawManifest = ct.ImageManifest{
+			Type: ct.ImageManifestTypeV1,
+		}.RawManifest()
+	}
+	if in.URI == "" {
+		in.URI = fmt.Sprintf("https://example.com/%s", random.String(8))
+	}
+	c.Assert(s.c.CreateArtifact(in), IsNil)
+	return in
 }
 
 func (s *S) TestCreateArtifact(c *C) {
 	for i, id := range []string{"", random.UUID()} {
 		in := &ct.Artifact{
 			ID:   id,
-			Type: "docker-image",
-			URI:  fmt.Sprintf("docker://flynn/host?id=adsf%d", i),
+			Type: ct.ArtifactTypeFlynn,
+			RawManifest: ct.ImageManifest{
+				Type: ct.ImageManifestTypeV1,
+			}.RawManifest(),
+			URI: fmt.Sprintf("https://example.com/manifest%d.json", i),
 		}
 		out := s.createTestArtifact(c, in)
 
 		c.Assert(out.Type, Equals, in.Type)
+		c.Assert(out.RawManifest, DeepEquals, in.RawManifest)
 		c.Assert(out.URI, Equals, in.URI)
 		c.Assert(out.ID, Not(Equals), "")
 		if id != "" {
 			c.Assert(out.ID, Equals, id)
 		}
 
-		gotArtifact := &ct.Artifact{}
-		res, err := s.Get("/artifacts/"+out.ID, gotArtifact)
+		gotArtifact, err := s.c.GetArtifact(out.ID)
 		c.Assert(err, IsNil)
 		c.Assert(gotArtifact, DeepEquals, out)
 
-		res, err = s.Get("/artifacts/fail"+out.ID, gotArtifact)
-		c.Assert(res.StatusCode, Equals, 404)
+		_, err = s.c.GetArtifact("fail" + out.ID)
+		c.Assert(err, Equals, controller.ErrNotFound)
 	}
 }
 
-func (s *S) createTestRelease(c *C, in *ct.Release) *ct.Release {
-	if in.ArtifactID == "" {
-		in.ArtifactID = s.createTestArtifact(c, &ct.Artifact{}).ID
+func (s *S) createTestRelease(c *C, appID string, in *ct.Release) *ct.Release {
+	if appID == "" {
+		appID = s.createTestApp(c, &ct.App{}).ID
 	}
-	out := &ct.Release{}
-	res, err := s.Post("/releases", in, out)
-	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
-	return out
-}
-
-func (s *S) createTestKey(c *C, in *ct.Key) *ct.Key {
-	out := &ct.Key{}
-	res, err := s.Post("/keys", in, out)
-	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
-	return out
+	if len(in.ArtifactIDs) == 0 {
+		in.ArtifactIDs = []string{s.createTestArtifact(c, &ct.Artifact{}).ID}
+		in.LegacyArtifactID = in.ArtifactIDs[0]
+	}
+	c.Assert(s.c.CreateRelease(appID, in), IsNil)
+	return in
 }
 
 func (s *S) TestCreateRelease(c *C) {
 	for _, id := range []string{"", random.UUID()} {
-		in := &ct.Release{ID: id}
-		out := s.createTestRelease(c, in)
-		c.Assert(out.ArtifactID, Equals, in.ArtifactID)
+		out := s.createTestRelease(c, "", &ct.Release{ID: id})
 		if id != "" {
 			c.Assert(out.ID, Equals, id)
 		}
 
-		gotRelease := &ct.Release{}
-		res, err := s.Get("/releases/"+out.ID, gotRelease)
+		gotRelease, err := s.c.GetRelease(out.ID)
 		c.Assert(err, IsNil)
 		c.Assert(gotRelease, DeepEquals, out)
 
-		res, err = s.Get("/releases/fail"+out.ID, gotRelease)
-		c.Assert(res.StatusCode, Equals, 404)
+		_, err = s.c.GetRelease("fail" + out.ID)
+		c.Assert(err, Equals, controller.ErrNotFound)
 	}
 }
 
 func (s *S) TestCreateFormation(c *C) {
 	for i, useName := range []bool{false, true} {
-		release := s.createTestRelease(c, &ct.Release{})
+		release := s.createTestRelease(c, "", &ct.Release{
+			Processes: map[string]ct.ProcessType{"web": {}},
+		})
 		app := s.createTestApp(c, &ct.App{Name: fmt.Sprintf("create-formation-%d", i)})
 
-		in := &ct.Formation{ReleaseID: release.ID, AppID: app.ID, Processes: map[string]int{"web": 1}}
+		// First create a formation with an invalid process type. Will fail.
+		in := &ct.Formation{ReleaseID: release.ID, AppID: app.ID, Processes: map[string]int{"foo": 1}}
 		if useName {
 			in.AppID = app.Name
 		}
+		err := s.c.PutFormation(in)
+		c.Assert(hh.IsValidationError(err), Equals, true)
+
+		// Now edit the formation to have valid process types. Should succeed.
+		in.Processes = map[string]int{"web": 1}
 		out := s.createTestFormation(c, in)
+		defer s.deleteTestFormation(out)
 		c.Assert(out.AppID, Equals, app.ID)
 		c.Assert(out.ReleaseID, Equals, release.ID)
 		c.Assert(out.Processes["web"], Equals, 1)
 
-		gotFormation := &ct.Formation{}
-		var path string
+		var appID string
 		if useName {
-			path = formationPath(app.Name, release.ID)
+			appID = app.Name
 		} else {
-			path = formationPath(app.ID, release.ID)
+			appID = app.ID
 		}
-		res, err := s.Get(path, gotFormation)
+		gotFormation, err := s.c.GetFormation(appID, release.ID)
 		c.Assert(err, IsNil)
-		c.Assert(res.StatusCode, Equals, 200)
 		c.Assert(gotFormation, DeepEquals, out)
 
-		res, err = s.Get(path+"fail", gotFormation)
-		c.Assert(res.StatusCode, Equals, 404, Commentf("path:%s formation:", path+"fail"))
+		expanded, err := s.c.GetExpandedFormation(appID, release.ID)
+		c.Assert(err, IsNil)
+		c.Assert(expanded.App.ID, Equals, app.ID)
+		c.Assert(expanded.Release.ID, Equals, release.ID)
+		c.Assert(expanded.Artifacts, HasLen, len(release.ArtifactIDs))
+		for i, id := range release.ArtifactIDs {
+			c.Assert(expanded.Artifacts[i].ID, Equals, id)
+		}
+		c.Assert(expanded.Processes, DeepEquals, out.Processes)
+
+		_, err = s.c.GetFormation(appID, release.ID+"fail")
+		c.Assert(err, Equals, controller.ErrNotFound)
 	}
 }
 
 func (s *S) createTestFormation(c *C, formation *ct.Formation) *ct.Formation {
-	path := formationPath(formation.AppID, formation.ReleaseID)
-	formation.AppID = ""
-	formation.ReleaseID = ""
-	out := &ct.Formation{}
-	res, err := s.Put(path, formation, out)
-	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
-	return out
+	c.Assert(s.c.PutFormation(formation), IsNil)
+	return formation
 }
 
-func formationPath(appID, releaseID string) string {
-	return "/apps/" + appID + "/formations/" + releaseID
+func (s *S) deleteTestFormation(formation *ct.Formation) {
+	s.c.DeleteFormation(formation.AppID, formation.ReleaseID)
 }
 
 func (s *S) TestDeleteFormation(c *C) {
 	for i, useName := range []bool{false, true} {
-		release := s.createTestRelease(c, &ct.Release{})
 		app := s.createTestApp(c, &ct.App{Name: fmt.Sprintf("delete-formation-%d", i)})
+		release := s.createTestRelease(c, app.ID, &ct.Release{})
+		s.createTestFormation(c, &ct.Formation{ReleaseID: release.ID, AppID: app.ID})
 
-		out := s.createTestFormation(c, &ct.Formation{ReleaseID: release.ID, AppID: app.ID})
-		var path string
+		var appID string
 		if useName {
-			path = formationPath(app.Name, release.ID)
+			appID = app.Name
 		} else {
-			path = formationPath(app.ID, release.ID)
+			appID = app.ID
 		}
-		res, err := s.Delete(path)
-		c.Assert(err, IsNil)
-		c.Assert(res.StatusCode, Equals, 200)
+		c.Assert(s.c.DeleteFormation(appID, release.ID), IsNil)
 
-		res, err = s.Get(path, out)
-		c.Assert(res.StatusCode, Equals, 404)
+		_, err := s.c.GetFormation(appID, release.ID)
+		c.Assert(err, Equals, controller.ErrNotFound)
 	}
-}
-
-func (s *S) TestCreateKey(c *C) {
-	in := &ct.Key{Key: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC5r1JfsAYIFi86KBa7C5nqKo+BLMJk29+5GsjelgBnCmn4J/QxOrVtovNcntoRLUCRwoHEMHzs3Tc6+PdswIxpX1l3YC78kgdJe6LVb962xUgP6xuxauBNRO7tnh9aPGyLbjl9j7qZAcn2/ansG1GBVoX1GSB58iBsVDH18DdVzlGwrR4OeNLmRQj8kuJEuKOoKEkW55CektcXjV08K3QSQID7aRNHgDpGGgp6XDi0GhIMsuDUGHAdPGZnqYZlxuUFaCW2hK6i1UkwnQCCEv/9IUFl2/aqVep2iX/ynrIaIsNKm16o0ooZ1gCHJEuUKRPUXhZUXqkRXqqHd3a4CUhH jonathan@titanous.com"}
-	out := s.createTestKey(c, in)
-
-	c.Assert(out.ID, Equals, "7ab054ff4a2009fadc67e1f8b380dbee")
-	c.Assert(out.Key, Equals, in.Key[:strings.LastIndex(in.Key, " ")])
-	c.Assert(out.Comment, Equals, "jonathan@titanous.com")
-
-	gotKey := &ct.Key{}
-	path := "/keys/" + out.ID
-	res, err := s.Get(path, gotKey)
-	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
-	c.Assert(gotKey, DeepEquals, out)
-
-	res, err = s.Get(path+"fail", gotKey)
-	c.Assert(res.StatusCode, Equals, 404)
-}
-
-func (s *S) TestDeleteKey(c *C) {
-	key := s.createTestKey(c, &ct.Key{Key: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDJv/RsyRxiSAh7cU236LOCZ3vD9PO87Fi32QbojQxuGDotmk65fN6WUuL7DQjzUnWkFRu4w/svmb+9MuYK0L2b4Kc1rKXBYaytzWqGtv2VaAFObth40AlNr0V26hcTcBNQQPa23Z8LwQNgELn2b/o2CK+Pie1UbE5lHg8R+pm03cI7fYPB0jA6LIS+IVKHslVhjzxtN49xm9W0DiCxouHZEl+Fd5asgtg10HN7CV5l2+ZFyrPAkxkQrzWpkUMgfvU+xFamyczzBKMT0fTYo+TUM3w3w3njJvqXdHjo3anrUF65rSFxfeNkXoe/NQDdvWu+XBfEypWv25hlQv91JI0N"})
-
-	path := "/keys/" + key.ID
-	res, err := s.Delete(path)
-	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
-
-	res, err = s.Get(path, key)
-	c.Assert(res.StatusCode, Equals, 404)
-}
-
-func (s *S) TestRecreateKey(c *C) {
-	key := &ct.Key{Key: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC3I4gHed4RioRMoJTFdVYp9S6QhHUtMe2cdQAmaN5lVuAaEe9GmJ/wtD4pd7sCpw9daCVOD/WWKCDunrwiEwMNzZKPFQPRfrGAgpCdweD+mk62n/DuaeKJFcfB4C/iLqUrYQ9q0QNnokchI4Ts/CaWoesJOQsbtxDwxcaOlYA/Yq/nY/RA3aK0ZfZqngrOjNRuvhnNFeCF94w2CwwX9ley+PtL0LSWOK2F9D/VEAoRMY89av6WQEoho3vLH7PIOP4OKdla7ezxP9nU14MN4PSv2yUS15mZ14SkA3EF+xmO0QXYUcUi4v5UxkBpoRYNAh32KMMD70pXPRCmWvZ5pRrH lewis@lmars.net"}
-
-	originalKey := s.createTestKey(c, key)
-	c.Assert(originalKey.ID, Equals, "0c0432006c63fc965ef6946fb67ab559")
-	c.Assert(originalKey.Key, Equals, key.Key[:strings.LastIndex(key.Key, " ")])
-	c.Assert(originalKey.Comment, Equals, "lewis@lmars.net")
-
-	// Post a duplicate
-	res, err := s.Post("/keys", key, &ct.Key{})
-	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
-
-	// Check there is still only one key
-	var list []ct.Key
-	res, err = s.Get("/keys", &list)
-	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
-	c.Assert(list, HasLen, 1)
-
-	// Delete the original
-	path := "/keys/" + originalKey.ID
-	res, err = s.Delete(path)
-	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
-
-	// Create the same key
-	newKey := s.createTestKey(c, key)
-	c.Assert(newKey.ID, Equals, "0c0432006c63fc965ef6946fb67ab559")
-	c.Assert(newKey.Key, Equals, key.Key[:strings.LastIndex(key.Key, " ")])
-	c.Assert(newKey.Comment, Equals, "lewis@lmars.net")
 }
 
 func (s *S) TestAppList(c *C) {
 	s.createTestApp(c, &ct.App{Name: "list-test"})
 
-	var list []ct.App
-	res, err := s.Get("/apps", &list)
+	list, err := s.c.AppList()
 	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
 
 	c.Assert(len(list) > 0, Equals, true)
 	c.Assert(list[0].ID, Not(Equals), "")
 }
 
 func (s *S) TestReleaseList(c *C) {
-	s.createTestRelease(c, &ct.Release{})
+	s.createTestRelease(c, "", &ct.Release{})
 
-	var list []ct.Release
-	res, err := s.Get("/releases", &list)
+	list, err := s.c.ReleaseList()
 	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
 
 	c.Assert(len(list) > 0, Equals, true)
 	c.Assert(list[0].ID, Not(Equals), "")
 }
 
-func (s *S) TestKeyList(c *C) {
-	s.createTestKey(c, &ct.Key{Key: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCqE9AJti/17eigkIhA7+6TF9rdTVxjPv80UxIT6ELaNPHegqib5m94Wab4UoZAGtBPLKJs9o8LRO3H29X5q5eXCU5mwx4qQhcMEYkILWj0Y1T39Xi2RI3jiWcTsphAAYmy+uT2Nt740OK1FaQxfdzYx4cjsjtb8L82e35BkJE2TdjXWkeHxZWDZxMlZXme56jTNsqB2OuC0gfbAbrjSCkolvK1RJbBZSSBgKQrYXiyYjjLfcw2O0ZAKPBeS8ckVf6PO8s/+azZzJZ0Kl7YGHYEX3xRi6sJS0gsI4Y6+sddT1zT5kh0Bg3C8cKnZ1NiVXLH0pPKz68PhjWhwpOVUehD"})
+func (s *S) TestFlynnArtifact(c *C) {
+	manifest := &ct.ImageManifest{Type: ct.ImageManifestTypeV1}
 
-	var list []ct.Key
-	res, err := s.Get("/keys", &list)
-	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
-
-	c.Assert(len(list) > 0, Equals, true)
-	c.Assert(list[0].ID, Not(Equals), "")
-
-	for _, k := range list {
-		s.Delete("/keys/" + k.ID)
+	type test struct {
+		desc     string
+		artifact *ct.Artifact
+		manifest *ct.ImageManifest
+		hashes   map[string]string
+		size     *int64
+		handler  http.HandlerFunc
+		assert   func(*test, error)
 	}
 
-	res, err = s.Get("/keys", &list)
+	isValid := func(t *test, err error) {
+		c.Assert(err, IsNil)
+		gotArtifact, err := s.c.GetArtifact(t.artifact.ID)
+		c.Assert(err, IsNil)
+		c.Assert(gotArtifact, DeepEquals, t.artifact)
+	}
+
+	isValidationErr := func(field, message string) func(*test, error) {
+		return func(t *test, err error) {
+			c.Assert(err, NotNil)
+			e, ok := err.(hh.JSONError)
+			if !ok {
+				c.Fatalf("expected JSONError, got %T", err)
+			}
+			c.Assert(e.Code, Equals, hh.ValidationErrorCode)
+			c.Assert(e.Message, Matches, fmt.Sprintf("%s.*%s", field, message))
+		}
+	}
+
+	isHashMismatchErr := func(t *test, err error) {
+		message := fmt.Sprintf(`expected sha512_256 hash %q but got ".*"`, manifest.Hashes()["sha512_256"])
+		isValidationErr("manifest", message)(t, err)
+	}
+
+	mux := http.NewServeMux()
+	var handler http.HandlerFunc
+	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
+		handler(w, req)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	for _, t := range []*test{
+		{
+			desc:   "zero size",
+			size:   typeconv.Int64Ptr(0),
+			assert: isValidationErr("size", "must be greater than zero"),
+		},
+		{
+			desc:   "negative size",
+			size:   typeconv.Int64Ptr(-1),
+			assert: isValidationErr("size", "must be greater than zero"),
+		},
+		{
+			desc:   "no hashes",
+			hashes: map[string]string{},
+			assert: isValidationErr("manifest", "no hashes provided"),
+		},
+		{
+			desc:   "unknown algorithm",
+			hashes: map[string]string{"foo": "bar"},
+			assert: isValidationErr("manifest", "no hashes provided"),
+		},
+		{
+			desc:     "known and unknown algorithm",
+			manifest: manifest,
+			hashes: map[string]string{
+				"sha512_256": manifest.Hashes()["sha512_256"],
+				"foo":        "bar",
+			},
+			assert: isValid,
+		},
+		{
+			desc:    "non-200 HTTP response",
+			handler: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(500) },
+			assert:  isValidationErr("manifest", "unexpected HTTP status: 500 Internal Server Error"),
+		},
+		{
+			desc:     "manifest too short",
+			manifest: &ct.ImageManifest{},
+			assert:   isValidationErr("manifest", "data too short"),
+		},
+		{
+			desc: "manifest too big",
+			manifest: &ct.ImageManifest{
+				Type: ct.ImageManifestTypeV1,
+				Meta: map[string]string{"foo": "bar"},
+			},
+			assert: isHashMismatchErr,
+		},
+		{
+			desc: "manifest different bytes",
+			manifest: &ct.ImageManifest{
+				Type: ct.ImageManifestType(strings.Replace(string(ct.ImageManifestTypeV1), "v", "w", 1)),
+			},
+			assert: isHashMismatchErr,
+		},
+		{
+			desc:     "valid manifest",
+			manifest: manifest,
+			assert:   isValid,
+		},
+	} {
+		c.Logf("testing %s", t.desc)
+		t.artifact = &ct.Artifact{
+			Type:   ct.ArtifactTypeFlynn,
+			URI:    srv.URL,
+			Hashes: t.hashes,
+		}
+		if t.size == nil {
+			data, _ := cjson.Marshal(manifest)
+			t.artifact.Size = int64(len(data))
+		}
+		if t.hashes == nil {
+			t.artifact.Hashes = manifest.Hashes()
+		}
+		if t.manifest != nil {
+			handler = func(w http.ResponseWriter, req *http.Request) {
+				w.Write(t.manifest.RawManifest())
+			}
+		} else {
+			handler = t.handler
+		}
+		err := s.c.CreateArtifact(t.artifact)
+		t.assert(t, err)
+	}
+}
+
+func (s *S) TestAppReleaseList(c *C) {
+	app := s.createTestApp(c, &ct.App{Name: "app-release-list"})
+
+	// create 2 releases with AppID set
+	releases := make([]*ct.Release, 2)
+	for i := 0; i < 2; i++ {
+		r := s.createTestRelease(c, app.ID, &ct.Release{})
+		releases[i] = r
+	}
+
+	// create a release for a different app
+	s.createTestRelease(c, "", &ct.Release{})
+
+	// check only the first two releases are returned, and in descending order
+	list, err := s.c.AppReleaseList(app.ID)
 	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
-	c.Assert(list, HasLen, 0)
+	c.Assert(list, HasLen, len(releases))
+	c.Assert(list[0], DeepEquals, releases[1])
+	c.Assert(list[1], DeepEquals, releases[0])
 }
 
 func (s *S) TestArtifactList(c *C) {
 	s.createTestArtifact(c, &ct.Artifact{})
 
-	var list []ct.Artifact
-	res, err := s.Get("/artifacts", &list)
+	list, err := s.c.ArtifactList()
 	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
 
 	c.Assert(len(list) > 0, Equals, true)
 	c.Assert(list[0].ID, Not(Equals), "")
 }
 
 func (s *S) TestFormationList(c *C) {
-	release := s.createTestRelease(c, &ct.Release{})
 	app := s.createTestApp(c, &ct.App{Name: "formation-list"})
+	release := s.createTestRelease(c, app.ID, &ct.Release{})
 	s.createTestFormation(c, &ct.Formation{ReleaseID: release.ID, AppID: app.ID})
 
-	var list []ct.Formation
-	path := "/apps/" + app.ID + "/formations"
-	res, err := s.Get(path, &list)
+	list, err := s.c.FormationList(app.ID)
 	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
 
 	c.Assert(len(list) > 0, Equals, true)
 	c.Assert(list[0].ReleaseID, Not(Equals), "")
 
 	for _, f := range list {
-		s.Delete(formationPath(f.AppID, f.ReleaseID))
+		c.Assert(s.c.DeleteFormation(f.AppID, f.ReleaseID), IsNil)
 	}
 
-	res, err = s.Get(path, &list)
+	list, err = s.c.FormationList(app.ID)
 	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
 	c.Assert(list, HasLen, 0)
 }
 
-func (s *S) setAppRelease(c *C, appID, id string) *ct.Release {
-	out := &ct.Release{}
-	res, err := s.Put("/apps/"+appID+"/release", &ct.Release{ID: id}, out)
-	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
-	return out
+func (s *S) setAppRelease(c *C, appID, id string) {
+	c.Assert(s.c.SetAppRelease(appID, id), IsNil)
 }
 
 func (s *S) TestSetAppRelease(c *C) {
-	release := s.createTestRelease(c, &ct.Release{})
 	app := s.createTestApp(c, &ct.App{Name: "set-release"})
+	release := s.createTestRelease(c, app.ID, &ct.Release{})
 
-	out := s.setAppRelease(c, app.ID, release.ID)
-	c.Assert(out, DeepEquals, release)
+	s.setAppRelease(c, app.ID, release.ID)
 
-	gotRelease := &ct.Release{}
-	res, err := s.Get("/apps/"+app.ID+"/release", gotRelease)
+	gotRelease, err := s.c.GetAppRelease(app.ID)
 	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
 	c.Assert(gotRelease, DeepEquals, release)
 
-	res, err = s.Get("/apps/"+app.Name+"/release", gotRelease)
+	gotRelease, err = s.c.GetAppRelease(app.Name)
 	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
 	c.Assert(gotRelease, DeepEquals, release)
 
-	var formations []ct.Formation
-	formationsPath := "/apps/" + app.ID + "/formations"
-	res, err = s.Get(formationsPath, &formations)
+	formations, err := s.c.FormationList(app.ID)
 	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
 	c.Assert(formations, HasLen, 0)
-
-	s.createTestFormation(c, &ct.Formation{AppID: app.ID, ReleaseID: release.ID, Processes: map[string]int{"web": 1}})
-	newRelease := s.createTestRelease(c, &ct.Release{})
-	s.setAppRelease(c, app.ID, newRelease.ID)
-	res, err = s.Get(formationsPath, &formations)
-	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
-	c.Assert(formations, HasLen, 1)
-	c.Assert(formations[0].ReleaseID, Equals, newRelease.ID)
 }
 
 func (s *S) createTestProvider(c *C, provider *ct.Provider) *ct.Provider {
-	out := &ct.Provider{}
-	res, err := s.Post("/providers", provider, out)
-	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
-	return out
+	c.Assert(s.c.CreateProvider(provider), IsNil)
+	return provider
 }
 
 func (s *S) TestCreateProvider(c *C) {
@@ -623,27 +650,71 @@ func (s *S) TestCreateProvider(c *C) {
 	c.Assert(provider.URL, Equals, "https://example.com")
 	c.Assert(provider.ID, Not(Equals), "")
 
-	gotProvider := &ct.Provider{}
-	res, err := s.Get("/providers/"+provider.ID, gotProvider)
+	gotProvider, err := s.c.GetProvider(provider.ID)
 	c.Assert(err, IsNil)
 	c.Assert(gotProvider, DeepEquals, provider)
 
-	res, err = s.Get("/providers/"+provider.Name, gotProvider)
+	gotProvider, err = s.c.GetProvider(provider.Name)
 	c.Assert(err, IsNil)
 	c.Assert(gotProvider, DeepEquals, provider)
 
-	res, err = s.Get("/apps/fail"+provider.ID, gotProvider)
-	c.Assert(res.StatusCode, Equals, 404)
+	_, err = s.c.GetProvider("fail" + provider.ID)
+	c.Assert(err, Equals, controller.ErrNotFound)
 }
 
 func (s *S) TestProviderList(c *C) {
 	s.createTestProvider(c, &ct.Provider{URL: "https://example.org", Name: "list-test"})
 
-	var list []ct.Provider
-	res, err := s.Get("/providers", &list)
+	list, err := s.c.ProviderList()
 	c.Assert(err, IsNil)
-	c.Assert(res.StatusCode, Equals, 200)
 
 	c.Assert(len(list) > 0, Equals, true)
 	c.Assert(list[0].ID, Not(Equals), "")
+}
+
+func (s *S) TestCreateSink(c *C) {
+	config := &ct.SyslogSinkConfig{
+		URL:    "syslog://example.com:514",
+		Prefix: "test",
+		UseIDs: true,
+	}
+	data, _ := json.Marshal(config)
+	cfg := json.RawMessage(data)
+	in := &ct.Sink{
+		Kind:   ct.SinkKindSyslog,
+		Config: &cfg,
+	}
+	c.Assert(s.c.CreateSink(in), IsNil)
+	c.Assert(in.ID, Not(Equals), "")
+	out, err := s.c.GetSink(in.ID)
+	c.Assert(err, IsNil)
+	c.Assert(out.ID, Equals, in.ID)
+	c.Assert(out.Config, NotNil)
+	outConfig := &ct.SyslogSinkConfig{}
+	err = json.Unmarshal(*out.Config, outConfig)
+	c.Assert(err, IsNil)
+	c.Assert(outConfig, DeepEquals, config)
+}
+
+func (s *S) TestGetCACertWithAuth(c *C) {
+	cert, err := s.c.GetCACert()
+	c.Assert(err, IsNil)
+	c.Assert(cert, DeepEquals, s.caCert)
+}
+
+func (s *S) TestGetCACertWithInvalidAuth(c *C) {
+	client, err := controller.NewClient(s.srv.URL, "invalid-key")
+	c.Assert(err, IsNil)
+	cert, err := client.GetCACert()
+	c.Assert(err, Not(IsNil))
+	c.Assert(len(cert), Equals, 0)
+	c.Assert(strings.Contains(err.Error(), "unexpected status 401"), Equals, true)
+}
+
+func (s *S) TestGetCACertWithoutAuth(c *C) {
+	client, err := controller.NewClient(s.srv.URL, "")
+	c.Assert(err, IsNil)
+	cert, err := client.GetCACert()
+	c.Assert(err, IsNil)
+	c.Assert(cert, DeepEquals, s.caCert)
 }

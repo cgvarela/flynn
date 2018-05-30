@@ -7,9 +7,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
 	"github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/go-docopt"
 )
 
 func init() {
@@ -22,7 +22,7 @@ usage: flynn env [-t <proc>]
 Manage app environment variables.
 
 Options:
-	-t, --process-type <proc>  set or read env for specified process type
+	-t, --process-type=<proc>  set or read env for specified process type
 
 Commands:
 	With no arguments, shows a list of environment variables.
@@ -50,7 +50,7 @@ Examples:
 
 var envProc string
 
-func runEnv(args *docopt.Args, client *controller.Client) error {
+func runEnv(args *docopt.Args, client controller.Client) error {
 	envProc = args.String["--process-type"]
 
 	if args.Bool["set"] {
@@ -90,7 +90,7 @@ func runEnv(args *docopt.Args, client *controller.Client) error {
 	return nil
 }
 
-func runEnvSet(args *docopt.Args, client *controller.Client) error {
+func runEnvSet(args *docopt.Args, client controller.Client) error {
 	pairs := args.All["<var>=<val>"].([]string)
 	env := make(map[string]*string, len(pairs))
 	for _, s := range pairs {
@@ -108,7 +108,7 @@ func runEnvSet(args *docopt.Args, client *controller.Client) error {
 	return nil
 }
 
-func runEnvUnset(args *docopt.Args, client *controller.Client) error {
+func runEnvUnset(args *docopt.Args, client controller.Client) error {
 	vars := args.All["<var>"].([]string)
 	env := make(map[string]*string, len(vars))
 	for _, s := range vars {
@@ -122,22 +122,26 @@ func runEnvUnset(args *docopt.Args, client *controller.Client) error {
 	return nil
 }
 
-func runEnvGet(args *docopt.Args, client *controller.Client) error {
+func runEnvGet(args *docopt.Args, client controller.Client) error {
 	arg := args.All["<var>"].([]string)[0]
 	release, err := client.GetAppRelease(mustApp())
 	if err == controller.ErrNotFound {
 		return errors.New("no app release found")
+	}
+	if err != nil {
+		return err
 	}
 
 	if _, ok := release.Processes[envProc]; envProc != "" && !ok {
 		return fmt.Errorf("process type %q not found in release %s", envProc, release.ID)
 	}
 
-	if v, ok := release.Env[arg]; ok {
+	if v, ok := release.Processes[envProc].Env[arg]; ok {
 		fmt.Println(v)
 		return nil
 	}
-	if v, ok := release.Processes[envProc].Env[arg]; ok {
+
+	if v, ok := release.Env[arg]; ok {
 		fmt.Println(v)
 		return nil
 	}
@@ -145,14 +149,14 @@ func runEnvGet(args *docopt.Args, client *controller.Client) error {
 	return fmt.Errorf("var %q not found in release %q", arg, release.ID)
 }
 
-func setEnv(client *controller.Client, proc string, env map[string]*string) (string, error) {
-	release, err := client.GetAppRelease(mustApp())
+func setEnv(client controller.Client, proc string, env map[string]*string) (string, error) {
+	app, err := client.GetApp(mustApp())
+	if err != nil {
+		return "", err
+	}
+	release, err := client.GetAppRelease(app.ID)
 	if err == controller.ErrNotFound {
-		artifact := &ct.Artifact{}
-		if err := client.CreateArtifact(artifact); err != nil {
-			return "", err
-		}
-		release = &ct.Release{ArtifactID: artifact.ID}
+		release = &ct.Release{}
 		if proc != "" {
 			release.Processes = make(map[string]ct.ProcessType)
 			release.Processes[proc] = ct.ProcessType{}
@@ -187,8 +191,11 @@ func setEnv(client *controller.Client, proc string, env map[string]*string) (str
 	}
 
 	release.ID = ""
-	if err := client.CreateRelease(release); err != nil {
+	if err := client.CreateRelease(app.ID, release); err != nil {
 		return "", err
 	}
-	return release.ID, client.SetAppRelease(mustApp(), release.ID)
+	if err := client.DeployAppRelease(app.ID, release.ID, nil); err != nil {
+		return "", err
+	}
+	return release.ID, nil
 }

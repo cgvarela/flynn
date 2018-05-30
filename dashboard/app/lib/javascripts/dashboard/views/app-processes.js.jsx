@@ -1,18 +1,9 @@
-/** @jsx React.DOM */
-//= require ../actions/app-processes
-//= require ./integer-picker
-//= require Modal
+import { assertEqual, extend } from 'marbles/utils';
+import Modal from 'Modal';
+import AppProcessesActions from '../actions/app-processes';
+import IntegerPicker from './integer-picker';
 
-(function () {
-
-"use strict";
-
-var AppProcessesActions = Dashboard.Actions.AppProcesses;
-
-var IntegerPicker = Dashboard.Views.IntegerPicker;
-var Modal = window.Modal;
-
-Dashboard.Views.AppProcesses = React.createClass({
+var AppProcesses = React.createClass({
 	displayName: "Views.AppProcesses",
 
 	render: function () {
@@ -60,7 +51,7 @@ Dashboard.Views.AppProcesses = React.createClass({
 
 	getInitialState: function () {
 		return {
-			processes: this.props.formation.processes, // initial value
+			processes: this.props.formation.processes || {}, // initial value
 			hasChanges: false,
 			isSaving: false,
 			showSaveConfirmModal: false
@@ -68,9 +59,9 @@ Dashboard.Views.AppProcesses = React.createClass({
 	},
 
 	componentWillReceiveProps: function (nextProps) {
-		if ( !Marbles.Utils.assertEqual(nextProps.formation, this.props.formation) ) {
+		if ( !assertEqual(nextProps.formation, this.props.formation) ) {
 			this.setState({
-				processes: nextProps.formation.processes,
+				processes: nextProps.formation.processes || {},
 				hasChanges: false,
 				isSaving: false,
 				showSaveConfirmModal: false
@@ -79,12 +70,12 @@ Dashboard.Views.AppProcesses = React.createClass({
 	},
 
 	__handleProcessChange: function (k, n) {
-		var originalProcesses = this.props.formation.processes;
-		var processes = Marbles.Utils.extend({}, this.state.processes);
+		var originalProcesses = this.props.formation.processes || {};
+		var processes = extend({}, this.state.processes);
 		processes[k] = n;
 		this.setState({
 			processes: processes,
-			hasChanges: !Marbles.Utils.assertEqual(originalProcesses, processes)
+			hasChanges: !assertEqual(originalProcesses, processes)
 		});
 	},
 
@@ -107,7 +98,7 @@ Dashboard.Views.AppProcesses = React.createClass({
 
 	__handleSaveBtnConfirmClick: function (e) {
 		e.preventDefault();
-		var formation = Marbles.Utils.extend({}, this.props.formation, {
+		var formation = extend({}, this.props.formation, {
 			processes: this.state.processes
 		});
 		this.setState({
@@ -118,4 +109,4 @@ Dashboard.Views.AppProcesses = React.createClass({
 	}
 });
 
-})();
+export default AppProcesses;

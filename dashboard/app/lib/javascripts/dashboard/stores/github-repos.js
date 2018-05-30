@@ -1,12 +1,11 @@
-//= require ../store
-//= require ../dispatcher
-//= require ./github-repo
+import QueryParams from 'marbles/query_params';
+import LinkHeader from 'marbles/http/link_header';
+import Store from '../store';
+import Config from '../config';
+import Dispatcher from '../dispatcher';
+import { rewriteGithubRepoJSON } from './github-repo-json';
 
-(function () {
-
-"use strict";
-
-var GithubRepos = Dashboard.Stores.GithubRepos = Dashboard.Store.createClass({
+var GithubRepos = Store.createClass({
 	displayName: "Stores.GithubRepos",
 
 	getState: function () {
@@ -30,16 +29,16 @@ var GithubRepos = Dashboard.Stores.GithubRepos = Dashboard.Store.createClass({
 
 	handleEvent: function (event) {
 		switch (event.name) {
-			case "GITHUB_REPOS:UNLAOD_PAGE_ID":
-				this.__unloadPageId(event.pageId);
+		case "GITHUB_REPOS:UNLAOD_PAGE_ID":
+			this.__unloadPageId(event.pageId);
 			break;
 
-			case "GITHUB_REPOS:FETCH_PREV_PAGE":
-				this.__fetchPrevPage();
+		case "GITHUB_REPOS:FETCH_PREV_PAGE":
+			this.__fetchPrevPage();
 			break;
 
-			case "GITHUB_REPOS:FETCH_NEXT_PAGE":
-				this.__fetchNextPage();
+		case "GITHUB_REPOS:FETCH_NEXT_PAGE":
+			this.__fetchNextPage();
 			break;
 		}
 	},
@@ -88,14 +87,14 @@ var GithubRepos = Dashboard.Stores.GithubRepos = Dashboard.Store.createClass({
 	},
 
 	__fetchRepos: function (options) {
-		var params = Marbles.QueryParams.replaceParams.apply(null, [[{
+		var params = QueryParams.replaceParams.apply(null, [[{
 			sort: "pushed",
 			type: "owner"
 		}]].concat(options.params || []));
-		var getReposFn = Dashboard.githubClient.getRepos;
+		var getReposFn = Config.githubClient.getRepos;
 
 		if (this.props.org) {
-			getReposFn = Dashboard.githubClient.getOrgRepos;
+			getReposFn = Config.githubClient.getOrgRepos;
 			params[0].org = this.props.org;
 
 			if (this.props.type === "fork") {
@@ -104,7 +103,7 @@ var GithubRepos = Dashboard.Stores.GithubRepos = Dashboard.Store.createClass({
 				params[0].type = "all";
 			}
 		} else if (this.props.type === "star") {
-			getReposFn = Dashboard.githubClient.getStarredRepos;
+			getReposFn = Config.githubClient.getStarredRepos;
 		}
 
 		var pageId = String(params[0].page);
@@ -113,7 +112,7 @@ var GithubRepos = Dashboard.Stores.GithubRepos = Dashboard.Store.createClass({
 			return;
 		}
 
-		getReposFn.call(Dashboard.githubClient, params).then(function (args) {
+		getReposFn.call(Config.githubClient, params).then(function (args) {
 			var res = args[0];
 			var xhr = args[1];
 
@@ -128,10 +127,10 @@ var GithubRepos = Dashboard.Stores.GithubRepos = Dashboard.Store.createClass({
 				if (link === null) {
 					return null;
 				}
-				return Marbles.QueryParams.deserializeParams(link.href.split("?")[1]);
+				return QueryParams.deserializeParams(link.href.split("?")[1]);
 			};
 
-			var links = Marbles.HTTP.LinkHeader.parse(xhr.getResponseHeader("Link") || "");
+			var links = LinkHeader.parse(xhr.getResponseHeader("Link") || "");
 			var prevParams = parseLinkParams("prev", links);
 			var nextParams = parseLinkParams("next", links);
 
@@ -185,9 +184,11 @@ var GithubRepos = Dashboard.Stores.GithubRepos = Dashboard.Store.createClass({
 		});
 	},
 
-});
+	__rewriteJSON: function (repoJSON) {
+		return rewriteGithubRepoJSON(repoJSON);
+	}
 
-GithubRepos.prototype.__rewriteJSON = Dashboard.Stores.GithubRepo.prototype.__rewriteJSON;
+});
 
 GithubRepos.findRepo = function (owner, repo) {
 	var instances = this.__instances;
@@ -215,6 +216,6 @@ GithubRepos.findRepo = function (owner, repo) {
 	return null;
 };
 
-GithubRepos.dispatcherIndex = GithubRepos.registerWithDispatcher(Dashboard.Dispatcher);
+GithubRepos.dispatcherIndex = GithubRepos.registerWithDispatcher(Dispatcher);
 
-})();
+export default GithubRepos;

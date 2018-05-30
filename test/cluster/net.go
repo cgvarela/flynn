@@ -10,17 +10,18 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/docker/docker/daemon/networkdriver/ipallocator"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/docker/libcontainer/netlink"
+	"github.com/docker/libnetwork/ipallocator"
 	"github.com/flynn/flynn/pkg/iptables"
 	"github.com/flynn/flynn/pkg/random"
+	"github.com/vishvananda/netlink"
 )
 
 type Bridge struct {
 	name   string
-	iface  *net.Interface
+	iface  *netlink.Bridge
 	ipAddr net.IP
 	ipNet  *net.IPNet
+	alloc  *ipallocator.IPAllocator
 }
 
 func (b *Bridge) IP() string {
@@ -28,21 +29,33 @@ func (b *Bridge) IP() string {
 }
 
 func createBridge(name, network, natIface string) (*Bridge, error) {
+	la := netlink.NewLinkAttrs()
+	la.Name = name
+	br := netlink.Link(&netlink.Bridge{LinkAttrs: la})
+
 	ipAddr, ipNet, err := net.ParseCIDR(network)
 	if err != nil {
 		return nil, err
 	}
-	if err := netlink.CreateBridge(name, true); err != nil {
+	if err := netlink.LinkAdd(br); err != nil {
 		return nil, err
 	}
-	iface, err := net.InterfaceByName(name)
+
+	iface, err := netlink.LinkByName(name)
 	if err != nil {
 		return nil, err
 	}
-	if err := netlink.NetworkLinkAddIp(iface, ipAddr, ipNet); err != nil {
+
+	// We need to explicitly assign the MAC address to avoid it changing to a lower value
+	// See: https://github.com/flynn/flynn/issues/223
+	mac := random.Bytes(5)
+	if err := netlink.LinkSetHardwareAddr(iface, append([]byte{0xfe}, mac...)); err != nil {
 		return nil, err
 	}
-	if err := netlink.NetworkLinkUp(iface); err != nil {
+	if netlink.AddrAdd(iface, &netlink.Addr{IPNet: &net.IPNet{IP: ipAddr, Mask: ipNet.Mask}}); err != nil {
+		return nil, err
+	}
+	if err := netlink.LinkSetUp(iface); err != nil {
 		return nil, err
 	}
 	if err := ioutil.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0644); err != nil {
@@ -51,17 +64,33 @@ func createBridge(name, network, natIface string) (*Bridge, error) {
 	if err := setupIPTables(name, natIface); err != nil {
 		return nil, err
 	}
-	return &Bridge{name, iface, ipAddr, ipNet}, nil
+
+	bridge := &Bridge{
+		name:   name,
+		iface:  iface.(*netlink.Bridge),
+		ipAddr: ipAddr,
+		ipNet:  ipNet,
+		alloc:  ipallocator.New(),
+	}
+	bridge.alloc.RequestIP(ipNet, ipAddr)
+	return bridge, nil
 }
 
 func deleteBridge(bridge *Bridge) error {
-	if err := netlink.NetworkLinkDown(bridge.iface); err != nil {
+	if err := netlink.LinkSetDown(bridge.iface); err != nil {
 		return err
 	}
-	if err := netlink.DeleteBridge(bridge.name); err != nil {
+	if err := netlink.LinkDel(bridge.iface); err != nil {
 		return err
 	}
+	cleanupIPTables(bridge.name)
 	return nil
+}
+
+func cleanupIPTables(bridgeName string) {
+	// Delete the forwarding rule. The postrouting rule does not need deletion
+	// as there is usually only one per box and it doesn't change.
+	iptables.Raw("-D", "FORWARD", "-i", bridgeName, "-j", "ACCEPT")
 }
 
 func setupIPTables(bridgeName, natIface string) error {
@@ -160,20 +189,17 @@ func deleteTap(name string) error {
 }
 
 type Tap struct {
-	Name              string
-	LocalIP, RemoteIP *net.IP
-	bridge            *Bridge
+	Name   string
+	IP     net.IP
+	bridge *Bridge
 }
 
 func (t *Tap) Close() error {
 	if err := deleteTap(t.Name); err != nil {
 		return err
 	}
-	if t.LocalIP != nil {
-		ipallocator.ReleaseIP(t.bridge.ipNet, t.LocalIP)
-	}
-	if t.RemoteIP != nil {
-		ipallocator.ReleaseIP(t.bridge.ipNet, t.RemoteIP)
+	if t.IP != nil {
+		t.bridge.alloc.ReleaseIP(t.bridge.ipNet, t.IP)
 	}
 	return nil
 }
@@ -189,7 +215,7 @@ iface eth0 inet static
 
 func (t *Tap) WriteInterfaceConfig(f io.Writer) error {
 	return ifaceConfig.Execute(f, map[string]string{
-		"Address": t.RemoteIP.String(),
+		"Address": t.IP.String(),
 		"Gateway": t.bridge.IP(),
 	})
 }
@@ -206,32 +232,22 @@ func (t *TapManager) NewTap(uid, gid int) (*Tap, error) {
 	}
 
 	var err error
-	tap.LocalIP, err = ipallocator.RequestIP(t.bridge.ipNet, nil)
+	tap.IP, err = t.bridge.alloc.RequestIP(t.bridge.ipNet, nil)
 	if err != nil {
 		tap.Close()
 		return nil, err
 	}
 
-	tap.RemoteIP, err = ipallocator.RequestIP(t.bridge.ipNet, nil)
+	iface, err := netlink.LinkByName(tap.Name)
 	if err != nil {
 		tap.Close()
 		return nil, err
 	}
-
-	iface, err := net.InterfaceByName(tap.Name)
-	if err != nil {
+	if err := netlink.LinkSetUp(iface); err != nil {
 		tap.Close()
 		return nil, err
 	}
-	if err := netlink.NetworkLinkAddIp(iface, *tap.LocalIP, t.bridge.ipNet); err != nil {
-		tap.Close()
-		return nil, err
-	}
-	if err := netlink.NetworkLinkUp(iface); err != nil {
-		tap.Close()
-		return nil, err
-	}
-	if err := netlink.AddToBridge(iface, t.bridge.iface); err != nil {
+	if err := netlink.LinkSetMaster(iface, t.bridge.iface); err != nil {
 		tap.Close()
 		return nil, err
 	}

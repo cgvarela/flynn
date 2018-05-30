@@ -1,16 +1,7 @@
-/** @jsx React.DOM */
-//= require ../stores/app-routes
-//= require ./external-link
-//= require ./route-link
-
-(function () {
-
-"use strict";
-
-var AppRoutesStore = Dashboard.Stores.AppRoutes;
-
-var ExternalLink = Dashboard.Views.ExternalLink;
-var RouteLink = Dashboard.Views.RouteLink;
+import { assertEqual } from 'marbles/utils';
+import { default as AppRoutesStore, shouldHTTPS } from '../stores/app-routes';
+import ExternalLink from './external-link';
+import RouteLink from './route-link';
 
 function getAppRoutesStoreId (props) {
 	return {
@@ -29,7 +20,7 @@ function getState (props) {
 	return state;
 }
 
-Dashboard.Views.AppRoutes = React.createClass({
+var AppRoutes = React.createClass({
 	displayName: "Views.AppRoutes",
 
 	render: function () {
@@ -37,16 +28,18 @@ Dashboard.Views.AppRoutes = React.createClass({
 		return (
 			<section className="app-routes">
 				<header>
-					<h2>Domains</h2>
+					<h2>Routes</h2>
 				</header>
 
 				<ul>
 					{this.state.routes.map(function (route) {
 						return (
-							<li key={route.id || route.config.domain}>
-								<ExternalLink href={"http://"+ route.config.domain}>{route.config.domain}</ExternalLink>
+							<li key={route.id || route.domain}>
+								<ExternalLink href={(shouldHTTPS(route) ? 'https://' : 'http://') + route.domain + route.path}>
+									{route.domain}{route.path}
+								</ExternalLink>
 								{route.id ? (
-									<RouteLink path={getAppPath("/routes/:route/delete", {route: route.id, domain: route.config.domain})}>
+									<RouteLink path={getAppPath("/routes/:type/:route/delete", {route: route.id, type: route.type, domain: route.domain})}>
 										<i className="icn-trash" />
 									</RouteLink>
 								) : null}
@@ -73,7 +66,7 @@ Dashboard.Views.AppRoutes = React.createClass({
 	componentWillReceiveProps: function (nextProps) {
 		var prevAppRoutesStoreId = this.state.appStoreId;
 		var nextAppRoutesStoreId = getAppRoutesStoreId(nextProps);
-		if ( !Marbles.Utils.assertEqual(prevAppRoutesStoreId, nextAppRoutesStoreId) ) {
+		if ( !assertEqual(prevAppRoutesStoreId, nextAppRoutesStoreId) ) {
 			AppRoutesStore.removeChangeListener(prevAppRoutesStoreId, this.__handleStoreChange);
 			AppRoutesStore.addChangeListener(nextAppRoutesStoreId, this.__handleStoreChange);
 			this.__handleStoreChange(nextProps);
@@ -89,4 +82,4 @@ Dashboard.Views.AppRoutes = React.createClass({
 	}
 });
 
-})();
+export default AppRoutes;

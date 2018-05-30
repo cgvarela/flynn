@@ -2,13 +2,12 @@ package bootstrap
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
-
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/discoverd/client/dialer"
 )
 
 type WaitAction struct {
@@ -22,7 +21,7 @@ func init() {
 }
 
 func (a *WaitAction) Run(s *State) error {
-	const waitMax = time.Minute
+	const waitMax = 5 * time.Minute
 	const waitInterval = 500 * time.Millisecond
 
 	if a.Status == 0 {
@@ -33,42 +32,64 @@ func (a *WaitAction) Run(s *State) error {
 	if err != nil {
 		return err
 	}
-	httpc := http.DefaultClient
-	if u.Scheme == "discoverd+http" {
-		if err := discoverd.Connect(""); err != nil {
-			return err
-		}
-		d := dialer.New(discoverd.DefaultClient, nil)
-		defer d.Close()
-		httpc = &http.Client{Transport: &http.Transport{Dial: d.Dial}}
-		u.Scheme = "http"
+	if err := lookupDiscoverdURLHost(s, u, waitMax); err != nil {
+		return err
 	}
 
-	start := time.Now()
+	timeout := time.After(waitMax)
 	for {
 		var result string
-		req, err := http.NewRequest("GET", u.String(), nil)
+
+		switch u.Scheme {
+		case "http":
+			req, err := http.NewRequest("GET", u.String(), nil)
+			if err != nil {
+				return err
+			}
+			if a.Host != "" {
+				req.Host = interpolate(s, a.Host)
+			}
+			res, err := http.DefaultClient.Do(req)
+			if err != nil {
+				result = fmt.Sprintf("%q", err)
+				goto fail
+			}
+			res.Body.Close()
+			if res.StatusCode == a.Status {
+				return nil
+			}
+			result = strconv.Itoa(res.StatusCode)
+		case "tcp":
+			conn, err := net.Dial("tcp", u.Host)
+			if err != nil {
+				result = fmt.Sprintf("%q", err)
+				goto fail
+			}
+			conn.Close()
+			return nil
+		default:
+			return fmt.Errorf("bootstrap: unknown protocol")
+		}
+	fail:
+		select {
+		case <-timeout:
+			return fmt.Errorf("bootstrap: timed out waiting for %s, last response %s", a.URL, result)
+		case <-time.After(waitInterval):
+		}
+	}
+}
+
+func lookupDiscoverdURLHost(s *State, u *url.URL, timeout time.Duration) error {
+	if strings.HasSuffix(u.Host, ".discoverd") {
+		d, err := s.DiscoverdClient()
 		if err != nil {
 			return err
 		}
-		if a.Host != "" {
-			req.Host = interpolate(s, a.Host)
-		}
-		res, err := httpc.Do(req)
+		instances, err := d.Instances(strings.Split(u.Host, ".")[0], timeout)
 		if err != nil {
-			result = fmt.Sprintf("%q", err)
-			goto fail
+			return err
 		}
-		res.Body.Close()
-		if res.StatusCode == a.Status {
-			return nil
-		}
-		result = strconv.Itoa(res.StatusCode)
-
-	fail:
-		if time.Now().Sub(start) >= waitMax {
-			return fmt.Errorf("bootstrap: timed out waiting for %s, last response %s", a.URL, result)
-		}
-		time.Sleep(waitInterval)
+		u.Host = instances[0].Addr
 	}
+	return nil
 }

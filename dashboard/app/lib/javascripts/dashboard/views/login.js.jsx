@@ -1,15 +1,7 @@
-/** @jsx React.DOM */
-//= require ./input
-//= require ./models/login
+import LoginModel from './models/login';
+import Input from './input';
 
-(function () {
-
-"use strict";
-
-var Input = Dashboard.Views.Input;
-var LoginModel = Dashboard.Views.Models.Login;
-
-Dashboard.Views.Login = React.createClass({
+var Login = React.createClass({
 	displayName: "Views.Login",
 
 	componentDidMount: function () {
@@ -23,7 +15,7 @@ Dashboard.Views.Login = React.createClass({
 
 	render: function () {
 		return (
-			<section>
+			<section className="login-container">
 				<header>
 					<h1>Log in</h1>
 				</header>
@@ -52,4 +44,4 @@ Dashboard.Views.Login = React.createClass({
 	}
 });
 
-})();
+export default Login;

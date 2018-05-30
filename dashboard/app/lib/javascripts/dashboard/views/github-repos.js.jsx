@@ -1,25 +1,12 @@
-/** @jsx React.DOM */
-//= require ../stores/github-user
-//= require ../stores/github-repos
-//= require ../actions/github-repos
-//= require ./helpers/getPath
-//= require ./route-link
-//= require ScrollPagination
-
-(function () {
-
-"use strict";
-
-var ScrollPagination = window.ScrollPagination;
-
-var GithubUserStore = Dashboard.Stores.GithubUser;
-var GithubReposStore = Dashboard.Stores.GithubRepos;
-
-var GithubReposActions = Dashboard.Actions.GithubRepos;
+import { assertEqual } from 'marbles/utils';
+import ScrollPagination from 'ScrollPagination';
+import GithubUserStore from '../stores/github-user';
+import GithubReposStore from '../stores/github-repos';
+import GithubReposActions from '../actions/github-repos';
+import getPath from './helpers/getPath';
+import RouteLink from './route-link';
 
 var userStoreId = "default";
-
-var getPath = Dashboard.Views.Helpers.getPath;
 
 function getRepoStoreId(props) {
 	return {
@@ -49,85 +36,6 @@ function getTypesState() {
 	return state;
 }
 
-Dashboard.Views.GithubRepos = React.createClass({
-	displayName: "Views.GithubRepos",
-
-	render: function () {
-		var handlePageEvent = this.__handlePageEvent;
-
-		return (
-			<div>
-				<Types selectedType={this.props.selectedType} selectedSource={this.props.selectedSource} />
-
-				<ScrollPagination
-					ref="scrollPagination"
-					key={this.state.reposStoreId}
-					hasPrevPage={this.state.reposHasPrevPage}
-					hasNextPage={this.state.reposHasNextPage}
-					unloadPage={GithubReposActions.unloadPageId.bind(null, this.state.reposStoreId)}
-					loadPrevPage={GithubReposActions.fetchPrevPage.bind(null, this.state.reposStoreId)}
-					loadNextPage={GithubReposActions.fetchNextPage.bind(null, this.state.reposStoreId)}>
-
-					{this.state.reposPages.map(function (page) {
-						return (
-							<ScrollPagination.Page
-								key={page.id}
-								id={page.id}
-								className="github-repos"
-								onPageEvent={handlePageEvent}
-								component={React.DOM.ul}>
-
-								{page.repos.map(function (repo) {
-									return (
-										<li key={repo.id}>
-											<Dashboard.Views.RouteLink path={getPath([{ repo: repo.name, owner: repo.ownerLogin, branch: repo.defaultBranch }])}>
-												<h2>
-													{repo.name} <small>{repo.language}</small>
-												</h2>
-												<p>{repo.description}</p>
-											</Dashboard.Views.RouteLink>
-										</li>
-									);
-								}, this)}
-							</ScrollPagination.Page>
-						);
-					}, this)}
-				</ScrollPagination>
-			</div>
-		);
-	},
-
-	getInitialState: function () {
-		return getState(this.props);
-	},
-
-	componentDidMount: function () {
-		GithubReposStore.addChangeListener(this.state.reposStoreId, this.__handleStoreChange);
-	},
-
-	componentWillReceiveProps: function (props) {
-		var oldRepoStoreId = this.state.reposStoreId;
-		var newRepoStoreId = getRepoStoreId(props);
-		if ( !Marbles.Utils.assertEqual(oldRepoStoreId, newRepoStoreId) ) {
-			GithubReposStore.removeChangeListener(oldRepoStoreId, this.__handleStoreChange);
-			GithubReposStore.addChangeListener(newRepoStoreId, this.__handleStoreChange);
-		}
-		this.setState(getState(props));
-	},
-
-	componentWillUnmount: function () {
-		GithubReposStore.removeChangeListener(this.state.reposStoreId, this.__handleStoreChange);
-	},
-
-	__handleStoreChange: function () {
-		this.setState(getState(this.props));
-	},
-
-	__handlePageEvent: function (pageId, event) {
-		this.refs.scrollPagination.handlePageEvent(pageId, event);
-	}
-});
-
 var Types = React.createClass({
 	displayName: "Views.GithubRepos - Types",
 
@@ -137,23 +45,23 @@ var Types = React.createClass({
 			<section className="github-repo-types">
 				<ul>
 					<li className={this.props.selectedType === null ? "selected" : null}>
-						<Dashboard.Views.RouteLink path={getPath([{ type: null }])}>
+						<RouteLink path={getPath([{ type: null }])}>
 							{this.props.selectedSource || (user ? user.login : "")}
-						</Dashboard.Views.RouteLink>
+						</RouteLink>
 					</li>
 
 					{this.props.selectedSource ? null : (
 						<li className={this.props.selectedType === "star" ? "selected" : null}>
-							<Dashboard.Views.RouteLink path={getPath([{ type: "star" }])}>
+							<RouteLink path={getPath([{ type: "star" }])}>
 								starred
-							</Dashboard.Views.RouteLink>
+							</RouteLink>
 						</li>
 					)}
 
 					<li className={this.props.selectedType === "fork" ? "selected" : null}>
-						<Dashboard.Views.RouteLink path={getPath([{ type: "fork" }])}>
+						<RouteLink path={getPath([{ type: "fork" }])}>
 							forked
-						</Dashboard.Views.RouteLink>
+						</RouteLink>
 					</li>
 				</ul>
 			</section>
@@ -181,4 +89,87 @@ var Types = React.createClass({
 	}
 });
 
-})();
+var GithubRepos = React.createClass({
+	displayName: "Views.GithubRepos",
+
+	render: function () {
+		return (
+			<div>
+				<Types selectedType={this.props.selectedType} selectedSource={this.props.selectedSource} />
+
+				<ScrollPagination
+					key={this.state.reposStoreId}
+					manager={this.props.scrollPaginationManager}
+					hasPrevPage={this.state.reposHasPrevPage}
+					hasNextPage={this.state.reposHasNextPage}
+					unloadPage={GithubReposActions.unloadPageId.bind(null, this.state.reposStoreId)}
+					loadPrevPage={GithubReposActions.fetchPrevPage.bind(null, this.state.reposStoreId)}
+					loadNextPage={GithubReposActions.fetchNextPage.bind(null, this.state.reposStoreId)}>
+
+					{this.state.reposPages.map(function (page) {
+						return (
+							<ScrollPagination.Page
+								key={page.id}
+								manager={this.props.scrollPaginationManager}
+								id={page.id}
+								className="github-repos"
+								component='ul'>
+
+								{page.repos.map(function (repo) {
+									return (
+										<li key={repo.id}>
+											<RouteLink path={getPath([{ repo: repo.name, owner: repo.ownerLogin, branch: repo.defaultBranch }])}>
+												<h2>
+													{repo.name} <small>{repo.language}</small>
+												</h2>
+												<p>{repo.description}</p>
+											</RouteLink>
+										</li>
+									);
+								}, this)}
+							</ScrollPagination.Page>
+						);
+					}, this)}
+				</ScrollPagination>
+			</div>
+		);
+	},
+
+	getDefaultProps: function () {
+		return {
+			scrollPaginationManager: new ScrollPagination.Manager()
+		};
+	},
+
+	getInitialState: function () {
+		return getState(this.props);
+	},
+
+	componentDidMount: function () {
+		GithubReposStore.addChangeListener(this.state.reposStoreId, this.__handleStoreChange);
+	},
+
+	componentWillReceiveProps: function (props) {
+		var oldRepoStoreId = this.state.reposStoreId;
+		var newRepoStoreId = getRepoStoreId(props);
+		if ( !assertEqual(oldRepoStoreId, newRepoStoreId) ) {
+			GithubReposStore.removeChangeListener(oldRepoStoreId, this.__handleStoreChange);
+			GithubReposStore.addChangeListener(newRepoStoreId, this.__handleStoreChange);
+		}
+		this.setState(getState(props));
+	},
+
+	componentWillUnmount: function () {
+		GithubReposStore.removeChangeListener(this.state.reposStoreId, this.__handleStoreChange);
+	},
+
+	__handleStoreChange: function () {
+		this.setState(getState(this.props));
+	},
+
+	__handlePageEvent: function (pageId, event) {
+		this.refs.scrollPagination.handlePageEvent(pageId, event);
+	}
+});
+
+export default GithubRepos;

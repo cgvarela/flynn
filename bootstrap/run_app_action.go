@@ -2,9 +2,15 @@ package bootstrap
 
 import (
 	"errors"
+	"fmt"
+	"net/url"
+	"time"
 
 	ct "github.com/flynn/flynn/controller/types"
 	"github.com/flynn/flynn/controller/utils"
+	hostresource "github.com/flynn/flynn/host/resource"
+	"github.com/flynn/flynn/host/types"
+	"github.com/flynn/flynn/pkg/cluster"
 	"github.com/flynn/flynn/pkg/random"
 	"github.com/flynn/flynn/pkg/resource"
 )
@@ -30,12 +36,6 @@ type RunAppState struct {
 	*ct.ExpandedFormation
 	Providers []*ct.Provider       `json:"providers"`
 	Resources []*resource.Resource `json:"resources"`
-	Jobs      []Job                `json:"jobs"`
-}
-
-type Job struct {
-	HostID string `json:"host_id"`
-	JobID  string `json:"job_id"`
 }
 
 func (a *RunAppAction) Run(s *State) error {
@@ -62,11 +62,11 @@ func (a *RunAppAction) Run(s *State) error {
 	if a.App.ID == "" {
 		a.App.ID = random.UUID()
 	}
-	if a.Artifact == nil {
-		return errors.New("bootstrap: artifact must be set")
+	if len(a.Artifacts) == 0 {
+		return errors.New("bootstrap: artifacts must be set")
 	}
-	if a.Artifact.ID == "" {
-		a.Artifact.ID = random.UUID()
+	if a.Artifacts[0].ID == "" {
+		a.Artifacts[0].ID = random.UUID()
 	}
 	if a.Release == nil {
 		return errors.New("bootstrap: release must be set")
@@ -74,19 +74,22 @@ func (a *RunAppAction) Run(s *State) error {
 	if a.Release.ID == "" {
 		a.Release.ID = random.UUID()
 	}
-	a.Release.ArtifactID = a.Artifact.ID
+	a.Release.ArtifactIDs = make([]string, len(a.Artifacts))
+	for i, artifact := range a.Artifacts {
+		a.Release.ArtifactIDs[i] = artifact.ID
+	}
 	if a.Release.Env == nil {
 		a.Release.Env = make(map[string]string)
 	}
 	interpolateRelease(s, a.Release)
 
 	for _, p := range a.Resources {
-		server, err := resource.NewServer(p.URL)
+		u, err := url.Parse(p.URL)
 		if err != nil {
 			return err
 		}
-		res, err := server.Provision(nil)
-		server.Close()
+		lookupDiscoverdURLHost(s, u, time.Second)
+		res, err := resource.Provision(u.String(), nil)
 		if err != nil {
 			return err
 		}
@@ -97,27 +100,78 @@ func (a *RunAppAction) Run(s *State) error {
 		}
 	}
 
-	cc, err := s.ClusterClient()
-	if err != nil {
-		return err
-	}
-	hosts, err := cc.ListHosts()
-	if err != nil {
-		return err
-	}
-	hostIDs := make([]string, 0, len(hosts))
-	for id := range hosts {
-		hostIDs = append(hostIDs, id)
-	}
 	for typ, count := range a.Processes {
+		if s.Singleton && count > 1 {
+			a.Processes[typ] = 1
+			count = 1
+		}
+		hosts := s.ShuffledHosts()
+		if a.ExpandedFormation.Release.Processes[typ].Omni {
+			count = len(hosts)
+		}
 		for i := 0; i < count; i++ {
-			job, err := startJob(s, hostIDs[i%len(hosts)], utils.JobConfig(a.ExpandedFormation, typ))
-			if err != nil {
+			host := hosts[i%len(hosts)]
+			config := utils.JobConfig(a.ExpandedFormation, typ, host.ID(), "")
+			hostresource.SetDefaults(&config.Resources)
+			for _, vol := range a.ExpandedFormation.Release.Processes[typ].Volumes {
+				if _, err := utils.ProvisionVolume(&vol, host, config); err != nil {
+					return err
+				}
+			}
+			if err := startJob(s, host, config); err != nil {
 				return err
 			}
-			as.Jobs = append(as.Jobs, *job)
 		}
 	}
 
 	return nil
+}
+
+func startJob(s *State, hc *cluster.Host, job *host.Job) error {
+	jobStatus := make(chan error)
+	events := make(chan *host.Event)
+	stream, err := hc.StreamEvents(job.ID, events)
+	if err != nil {
+		return err
+	}
+	go func() {
+		defer stream.Close()
+	loop:
+		for {
+			select {
+			case e, ok := <-events:
+				if !ok {
+					break loop
+				}
+				switch e.Event {
+				case "start", "stop":
+					jobStatus <- nil
+					return
+				case "error":
+					job, err := hc.GetJob(job.ID)
+					if err != nil {
+						jobStatus <- err
+						return
+					}
+					if job.Error == nil {
+						jobStatus <- fmt.Errorf("bootstrap: unknown error from host")
+						return
+					}
+					jobStatus <- fmt.Errorf("bootstrap: host error while launching job: %q", *job.Error)
+					return
+				default:
+				}
+			case <-time.After(30 * time.Second):
+				jobStatus <- errors.New("bootstrap: timed out waiting for job event")
+				return
+			}
+		}
+		jobStatus <- fmt.Errorf("bootstrap: host job stream disconnected unexpectedly: %q", stream.Err())
+	}()
+
+	if err := hc.AddJob(job); err != nil {
+		return err
+	}
+
+	return <-jobStatus
 }

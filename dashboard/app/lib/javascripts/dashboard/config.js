@@ -1,14 +1,18 @@
-//= require ./static-config
-//= require ./dispatcher
+import { extend } from 'marbles/utils';
+import HTTP from 'marbles/http';
+import WithCredentialsMiddleware from 'marbles/http/middleware/with_credentials';
+import SerializeJSONMiddleware from 'marbles/http/middleware/serialize_json';
+import StaticConfig from './static-config';
+import Dispatcher from './dispatcher';
 
-(function () {
-"use strict";
-
-var Dispatcher = Dashboard.Dispatcher;
-var config = Dashboard.config;
+var Config = extend({
+	waitForRouteHandler: Promise.resolve(),
+	client: null,
+	githubClient: null
+}, StaticConfig);
 var fetchedProperties = [];
 
-Dashboard.config.fetch = function () {
+Config.fetch = function () {
 	var resolve, reject;
 	var promise = new Promise(function (rs, rj) {
 		resolve = rs;
@@ -16,53 +20,53 @@ Dashboard.config.fetch = function () {
 	});
 
 	var handleFailure = function (res, xhr) {
-		config.err = new Error("SERVICE_UNAVAILABLE");
+		Config.err = new Error("SERVICE_UNAVAILABLE");
 
 		Dispatcher.handleAppEvent({
 			name: "SERVICE_UNAVAILABLE",
 			status: xhr.status
 		});
 
-		reject(config.err);
+		reject(Config.err);
 	};
 
 	var handleSuccess = function (res) {
-		config.err = null;
+		Config.err = null;
 
-		// clear all fetched properties from config
+		// clear all fetched properties from Config
 		fetchedProperties.forEach(function (k) {
-			delete config[k];
+			delete Config[k];
 		});
 		fetchedProperties = [];
 
-		// add fetched properties to config
+		// add fetched properties to Config
 		for (var k in res) {
 			if (res.hasOwnProperty(k)) {
 				fetchedProperties.push(k);
-				config[k] = res[k];
+				Config[k] = res[k];
 			}
 		}
 
 		// make all endpoints absolute URLs
-		var endpoints = config.endpoints;
+		var endpoints = Config.endpoints;
 		for (k in endpoints) {
 			if (endpoints.hasOwnProperty(k) && endpoints[k][0] === "/") {
-				endpoints[k] = config.API_SERVER + endpoints[k];
+				endpoints[k] = Config.API_SERVER + endpoints[k];
 			}
 		}
 
 		var authenticated = res.hasOwnProperty("user");
 		var authenticatedChanged = false;
-		if (authenticated !== config.authenticated) {
+		if (authenticated !== Config.authenticated) {
 			authenticatedChanged = true;
-			config.authenticated = authenticated;
+			Config.authenticated = authenticated;
 		}
 
 		var githubAuthenticated = !!(res.user && res.user.auths && res.user.auths.hasOwnProperty("github"));
 		var githubAuthenticatedChanged = false;
-		if (githubAuthenticated !== config.githubAuthenticated) {
+		if (githubAuthenticated !== Config.githubAuthenticated) {
 			githubAuthenticatedChanged = true;
-			config.githubAuthenticated = githubAuthenticated;
+			Config.githubAuthenticated = githubAuthenticated;
 		}
 
 		Dispatcher.handleAppEvent({
@@ -83,15 +87,15 @@ Dashboard.config.fetch = function () {
 			});
 		}
 
-		resolve(config);
+		resolve(Config);
 	};
 
-	Marbles.HTTP({
+	HTTP({
 		method: 'GET',
-		url: Dashboard.config.API_SERVER + "/config",
+		url: Config.API_SERVER.replace(/^https?:/, window.location.protocol) + "/config",
 		middleware: [
-			Marbles.HTTP.Middleware.WithCredentials,
-			Marbles.HTTP.Middleware.SerializeJSON
+			WithCredentialsMiddleware,
+			SerializeJSONMiddleware
 		],
 		callback: function (res, xhr) {
 			if (xhr.status !== 200 || !String(xhr.getResponseHeader('Content-Type')).match(/application\/json/)) {
@@ -105,4 +109,41 @@ Dashboard.config.fetch = function () {
 	return promise;
 };
 
-})();
+Config.setGithubToken = function (token) {
+	if (token) {
+		Config.githubAuthenticated = true;
+		Config.user.auths.github = { access_token: token };
+		Dispatcher.handleAppEvent({
+			name: "GITHUB_AUTH_CHANGE",
+			authenticated: true
+		});
+	} else {
+		Config.githubAuthenticated = false;
+		Config.user.auths.github = null;
+		Dispatcher.handleAppEvent({
+			name: "GITHUB_AUTH_CHANGE",
+			authenticated: false
+		});
+	}
+};
+
+Config.setClient = function (client) {
+	Config.client = client;
+};
+
+Config.setGithubClient = function (client) {
+	Config.githubClient = client;
+};
+
+Config.setDashboardAppID = function (appID) {
+	Config.dashboardAppID = appID;
+};
+
+Config.freezeNav = function () {
+	Config.isNavFrozen = true;
+};
+
+Config.unfreezeNav = function () {
+	Config.isNavFrozen = false;
+};
+export default Config;
